@@ -54,19 +54,16 @@ No pip installs. Everything is stdlib.
 Add the marketplace and install the plugin from inside Claude Code:
 
 ```
-/plugin marketplace add REPLACE_ME/persistent-continuity
+/plugin marketplace add Cyg0r3/persistent-continuity
 /plugin install persistent-continuity@persistent-continuity
 ```
-
-(Replace `REPLACE_ME/...` with the GitHub `owner/repo` once you've pushed it, or point at
-a local clone path.)
 
 Then **restart Claude Code** so the hooks load.
 
 ### Manual install (no marketplace)
 
 ```
-git clone https://github.com/REPLACE_ME/persistent-continuity.git
+git clone https://github.com/Cyg0r3/persistent-continuity.git
 ```
 Then in Claude Code: `/plugin marketplace add /path/to/persistent-continuity` and
 `/plugin install persistent-continuity@persistent-continuity`.

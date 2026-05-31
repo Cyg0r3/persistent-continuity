@@ -5,8 +5,8 @@
   "author": {
     "name": "Michael Niemiec"
   },
-  "homepage": "https://github.com/REPLACE_ME/persistent-continuity",
-  "repository": "https://github.com/REPLACE_ME/persistent-continuity",
+  "homepage": "https://github.com/Cyg0r3/persistent-continuity",
+  "repository": "https://github.com/Cyg0r3/persistent-continuity",
   "license": "MIT",
   "keywords": ["memory", "continuity", "context", "event-sourcing", "cognitive-graph", "attention", "long-horizon"]
 }
