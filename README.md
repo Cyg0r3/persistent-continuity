@@ -144,9 +144,3 @@ python system/cognition.py threads                   # list threads (active/dorm
 
 Data root resolves the same way for the CLI as for the hooks (`CONTINUITY_HOME` or
 `<cwd>/.continuity`), so run them from your project directory.
-
----
-
-## License
-
-MIT — see [LICENSE](LICENSE).
