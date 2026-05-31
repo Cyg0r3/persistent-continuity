@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# A user's own continuity memory must never be committed to this repo
+.continuity/
+**/runtime/events.jsonl
+**/runtime/*.db
+**/index/*.db
+**/index/cursor
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

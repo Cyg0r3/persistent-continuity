@@ -1,0 +1,55 @@
+{
+  "description": "Persistent Continuity lifecycle hooks: restore working state on session start, checkpoint on context pressure / session end, and run an adaptive drift refresh on each prompt. All hooks no-op silently in projects that have not run /continuity-init (no .continuity/ is created until then). Requires `python` on PATH; data lives in <cwd>/.continuity or $CONTINUITY_HOME.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/system/runtime.py\" restore --print",
+            "timeout": 30,
+            "statusMessage": "Restoring continuity working context"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/system/cognition.py\" refresh --hook",
+            "timeout": 20,
+            "statusMessage": "Continuity adaptive refresh (drift check)"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/system/runtime.py\" checkpoint --reason \"auto: pre-compact\" --keep-open",
+            "timeout": 30,
+            "suppressOutput": true,
+            "statusMessage": "Continuity checkpoint (context pressure)"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/system/runtime.py\" checkpoint --reason \"auto: session-end\"",
+            "timeout": 30,
+            "suppressOutput": true,
+            "statusMessage": "Continuity checkpoint (session end)"
+          }
+        ]
+      }
+    ]
+  }
+}

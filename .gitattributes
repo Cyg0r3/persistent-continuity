@@ -1,0 +1,6 @@
+# Normalize line endings: ship LF for code/text so hooks and scripts run on any OS.
+* text=auto eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.sh text eol=lf

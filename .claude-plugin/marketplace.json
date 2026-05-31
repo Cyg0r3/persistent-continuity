@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "persistent-continuity",
+  "version": "3.0.0",
+  "description": "Persistent Continuity — cognition-native long-horizon memory for Claude Code.",
+  "owner": {
+    "name": "Michael Niemiec"
+  },
+  "plugins": [
+    {
+      "name": "persistent-continuity",
+      "source": "./plugins/persistent-continuity",
+      "description": "Append-only event log as truth + a cognitive graph focused by attention. Reconstructs your working state across sessions, context limits, and compaction. Local-first, pure stdlib.",
+      "version": "3.0.0",
+      "category": "productivity",
+      "author": {
+        "name": "Michael Niemiec"
+      }
+    }
+  ]
+}

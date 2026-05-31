@@ -1,0 +1,12 @@
+{
+  "name": "persistent-continuity",
+  "description": "Cognition-native persistent memory for Claude Code. An append-only event log is the only source of truth; a self-maintaining cognitive graph focused by spreading-activation attention reconstructs your working state across sessions, context limits, and compaction. Pure Python stdlib, local-first, no API keys.",
+  "version": "3.0.0",
+  "author": {
+    "name": "Michael Niemiec"
+  },
+  "homepage": "https://github.com/REPLACE_ME/persistent-continuity",
+  "repository": "https://github.com/REPLACE_ME/persistent-continuity",
+  "license": "MIT",
+  "keywords": ["memory", "continuity", "context", "event-sourcing", "cognitive-graph", "attention", "long-horizon"]
+}
