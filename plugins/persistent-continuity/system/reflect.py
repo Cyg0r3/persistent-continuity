@@ -14,6 +14,13 @@ Two periodic, autonomous-capable passes over the cognitive graph (ARCHITECTURE_V
               dormant threads are summarized; originals stay in events.jsonl (truth is
               never destroyed) but the digest stands in for the hot retrieval set.
 
+  resolve   — the `memory` agent's conflict pass (§9): settle each contradiction via the
+              same spreading-activation + lateral inhibition; when one rival dominates by
+              a clear margin, propose an `assumption_invalidated` for the loser (and a
+              `loop_closed` for any loop it owns). DRY-RUN by default — append only with
+              --apply. Append-only means resolution never collides; it only adds
+              interpretation, never edits truth.
+
 Both are pure projections of L1 truth via the L2 graph (cognition.db). Reflection appends
 ONE event (replayable); compression writes only markdown under threads/.
 
@@ -21,6 +28,8 @@ Subcommands:
     python reflect.py reflect [--quiet]    Run reflection; append a `reflection` event
     python reflect.py compress             (Re)write thread digests under threads/
     python reflect.py digest <thread_id>   Print a single thread's digest to stdout
+    python reflect.py resolve [--apply]    memory-agent: resolve decisive contradictions
+                                           (dry-run unless --apply)
     python reflect.py all                  reflect + compress
 
 Pure stdlib. Reuses cognition.build (graph) and runtime.append (truth log).
@@ -45,6 +54,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 STALE_DAYS = 14.0          # thread untouched longer than this = stale branch (demote)
 LOOP_AGING_DAYS = 7.0      # an open loop older than this is "aging" (nudged in reflection)
+RESOLVE_MARGIN = 0.15      # min winner-loser activation gap to call a contradiction decided
+                           # (after lateral inhibition has amplified the asymmetry, §5.5)
 
 
 def now() -> datetime:
@@ -129,6 +140,72 @@ def reflect(quiet: bool = False) -> dict:
     if not quiet:
         print(summary)
     return result
+
+
+# ─── memory-agent conflict resolution (§9) ───────────────────────────────────
+
+def resolve(apply: bool = False, quiet: bool = False) -> dict:
+    """The `memory` agent's conflict pass. Settle each contradiction with the shared
+    graph's spreading-activation + lateral inhibition (cognition.attend, memory window);
+    for every DECISIVE one (winner-loser gap >= RESOLVE_MARGIN) propose the interpretive
+    event that records the resolution:
+      - loser is itself an open loop   -> `loop_closed`
+      - otherwise (a hypothesis/etc.)  -> `assumption_invalidated` for the loser
+
+    Dry-run by default (prints proposals); with apply=True it appends them, tagged
+    agent="memory". Append-only => this never collides with other agents' writes — it
+    only adds interpretation, never edits truth. Contradictions inside RESOLVE_MARGIN
+    stay live (no evidence to lean)."""
+    import cognition
+    cognition.build()
+    state = cognition.attend(agent="memory")   # inhibition-settled, memory-scoped window
+
+    conn = sqlite3.connect(COG_DB)
+    conn.row_factory = sqlite3.Row
+    meta = {r["event_id"]: r for r in conn.execute(
+        "SELECT event_id,type,body FROM nodes")}
+    conn.close()
+    import runtime
+    by_eid = {e.get("event_id"): e for e in runtime.read_events()}
+
+    proposals, undecided = [], []
+    for a, b, sa, sb in state["contradictions"]:
+        if abs(sa - sb) < RESOLVE_MARGIN:
+            undecided.append((a, b, round(sa, 3), round(sb, 3)))
+            continue
+        winner, loser = (a, b) if sa >= sb else (b, a)
+        lmeta = meta.get(loser)
+        wbody = (meta.get(winner)["body"] if meta.get(winner) else winner)[:80]
+        if lmeta and lmeta["type"] == "open_loop":
+            loop_id = (by_eid.get(loser) or {}).get("id") or loser
+            proposals.append({"type": "loop_closed", "id": loop_id, "causes": [winner],
+                              "msg": f"superseded by {winner}: {wbody}",
+                              "_loser": loser, "_winner": winner})
+        else:
+            proposals.append({"type": "assumption_invalidated", "target": loser,
+                              "causes": [winner],
+                              "msg": f"resolved in favor of {winner}: {wbody}",
+                              "_loser": loser, "_winner": winner})
+
+    applied = []
+    for p in proposals:
+        loser, winner = p.pop("_loser"), p.pop("_winner")
+        verb = "APPLY " if apply else "would "
+        if not quiet:
+            print(f"  {verb}{p['type']:<22} loser={loser} winner={winner}")
+        if apply:
+            etype = p.pop("type")
+            runtime.append(etype, agent="memory", **p)
+            applied.append({"type": etype, "loser": loser, "winner": winner})
+
+    if not quiet:
+        if not proposals:
+            print("  no decisive contradictions "
+                  f"({len(undecided)} live, within margin {RESOLVE_MARGIN})")
+        elif not apply:
+            print(f"\n  dry-run: {len(proposals)} proposal(s). Re-run with --apply to write.")
+    return {"proposals": len(proposals), "applied": applied,
+            "undecided": undecided}
 
 
 # ─── compression: thread digests (§9; replaces session snapshots) ────────────
@@ -233,6 +310,8 @@ def main(argv):
         reflect(quiet="--quiet" in rest); return 0
     if cmd == "compress":
         compress(); return 0
+    if cmd == "resolve":
+        resolve(apply="--apply" in rest, quiet="--quiet" in rest); return 0
     if cmd == "digest":
         if not rest:
             print("usage: reflect.py digest <thread_id>"); return 2
