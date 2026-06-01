@@ -76,8 +76,11 @@ REINFORCE_TOP_N = 3    # how many focus nodes get an `attended` event on reinfor
 
 EDGE_WEIGHT = {"causal": 1.0, "membership": 0.7, "thread_rel": 0.4,
                "concept": 0.6,        # v4 Phase 2: concept <-> evidence episode (semantic recall)
+               "procedure": 0.6,      # v4 Phase 3: procedure <-> evidence episode (how-to recall)
                "contradiction": 0.0}  # contradiction handled by inhibition, not spread
 CONCEPT_SEED = 0.55       # v4 Phase 2: in-scope concepts seed attention (scaled by salience)
+PROCEDURE_SEED = 0.6      # v4 Phase 3: a procedure seeds attention only when its trigger
+                          # matches the current situation (scaled by outcome_score)
 
 # ── multi-agent attention windows (ARCHITECTURE_V3.md §9) ────────────────────
 # Each agent computes its OWN attention over the ONE shared graph: same engine,
@@ -206,16 +209,24 @@ CREATE TABLE concepts (
     support INTEGER DEFAULT 0, formed_t TEXT
 );
 CREATE TABLE concept_evidence (concept_id TEXT, event_id TEXT);
+-- v4 Phase 3 procedural memory: reusable how-to workflows + their evidence episodes.
+CREATE TABLE procedures (
+    procedure_id TEXT PRIMARY KEY, label TEXT, steps TEXT, trigger TEXT,
+    outcome_score REAL DEFAULT 0.5, uses INTEGER DEFAULT 0, last_used_t TEXT
+);
+CREATE TABLE procedure_evidence (procedure_id TEXT, event_id TEXT);
 CREATE INDEX ix_mem_thread ON membership(thread_id);
 CREATE INDEX ix_edges_dst ON edges(dst);
 CREATE INDEX ix_edges_src ON edges(src);
 CREATE INDEX ix_cev_concept ON concept_evidence(concept_id);
+CREATE INDEX ix_pev_procedure ON procedure_evidence(procedure_id);
 """
 
 # Bump when the cache SCHEMA or its projection logic changes so an older cognition.db
 # never silently satisfies the watermark skip (forces one rebuild). Phase 2 added the
-# concepts/concept_evidence tables and the `concept` edge.
-SCHEMA_VERSION = 2
+# concepts/concept_evidence tables and the `concept` edge; Phase 3 added the
+# procedures/procedure_evidence tables and the `procedure` edge.
+SCHEMA_VERSION = 3
 
 
 def _build_watermark(db_path: Path) -> int:
@@ -361,6 +372,8 @@ def build(db_path: Path = COG_DB, force: bool = False) -> dict:
 
     # v4 Phase 2: materialize semantic memory from concept_formed events (curator truth).
     _build_concepts(conn, events)
+    # v4 Phase 3: materialize procedural memory from procedure_learned events.
+    _build_procedures(conn, events)
 
     # watermark: record the event count + schema version this build is a projection of.
     conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('event_count',?)",
@@ -374,6 +387,7 @@ def build(db_path: Path = COG_DB, force: bool = False) -> dict:
         "threads": len(threads),
         "edges": conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
         "concepts": conn.execute("SELECT COUNT(*) FROM concepts").fetchone()[0],
+        "procedures": conn.execute("SELECT COUNT(*) FROM procedures").fetchone()[0],
         "skipped": False,
     }
     conn.close()
@@ -427,6 +441,68 @@ def _build_concepts(conn, events: list) -> None:
             conn.execute("INSERT INTO concept_evidence VALUES (?,?)", (cid, eid))
             conn.execute("INSERT INTO edges VALUES (?,?,?,?)",
                          (cid, eid, "concept", EDGE_WEIGHT["concept"]))
+
+
+def _procedure_id_of(e: dict) -> str:
+    return e.get("procedure_id") or e.get("id") or ""
+
+
+def _build_procedures(conn, events: list) -> None:
+    """Project `procedure_learned` events into procedural memory (v4 Phase 3 §5.2).
+
+    Procedures are curator-emitted truth: each event names a procedure, a label, the
+    ordered `steps`, a `trigger` cue (when it applies), and the evidence episodes the
+    workflow was distilled from. Replaying in order accumulates uses + evidence (a later
+    `procedure_learned` for the same id reinforces it, lifting its outcome_score). Each
+    procedure is ALSO materialized as a graph node (type='procedure', layer='procedural')
+    wired to its evidence by `procedure` edges, so spreading activation flows
+    episode<->how-to and the procedure can seed/surface in working memory once its trigger
+    matches. Truth stays in the log; absent procedure_learned events ⇒ empty procedural
+    memory (current behavior)."""
+    acc: dict = {}   # procedure_id -> {label, steps:list, trigger:list, score, uses, evidence:set, last_t}
+    for e in events:
+        if e.get("type") != "procedure_learned":
+            continue
+        pid = _procedure_id_of(e)
+        if not pid:
+            continue
+        ev = _as_list(e.get("evidence"))
+        p = acc.setdefault(pid, {"label": "", "steps": [], "trigger": [], "score": None,
+                                 "uses": 0, "evidence": set(), "last_t": e.get("t")})
+        p["label"] = e.get("label") or e.get("summary") or e.get("msg") or p["label"] or pid
+        trig = _as_list(e.get("trigger"))
+        if trig:
+            p["trigger"] = trig
+        steps = e.get("steps")
+        if isinstance(steps, list) and steps:
+            p["steps"] = [str(s) for s in steps]
+        elif isinstance(steps, str) and steps:
+            p["steps"] = [steps]
+        p["evidence"].update(ev)
+        p["uses"] += 1                       # each learned/reinforced emission = one use
+        p["last_t"] = e.get("t") or p["last_t"]
+        if e.get("outcome_score") is not None:
+            p["score"] = float(e["outcome_score"])
+    for pid, p in acc.items():
+        # outcome_score: explicit, else a confidence that climbs with reinforcement uses.
+        score = p["score"] if p["score"] is not None else round(min(0.9, 0.5 + 0.1 * (p["uses"] - 1)), 4)
+        conn.execute(
+            "INSERT OR REPLACE INTO procedures"
+            "(procedure_id,label,steps,trigger,outcome_score,uses,last_used_t)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (pid, p["label"], "\n".join(p["steps"]), ",".join(p["trigger"]),
+             score, p["uses"], p["last_t"]))
+        # procedure node so it participates in attention / working memory
+        conn.execute(
+            "INSERT OR REPLACE INTO nodes"
+            "(event_id,seq,t,type,layer,body,importance,unresolved,reinforced)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (pid, None, p["last_t"], "procedure", "procedural",
+             p["label"], score, 0, 0))
+        for eid in p["evidence"]:
+            conn.execute("INSERT INTO procedure_evidence VALUES (?,?)", (pid, eid))
+            conn.execute("INSERT INTO edges VALUES (?,?,?,?)",
+                         (pid, eid, "procedure", EDGE_WEIGHT["procedure"]))
 
 
 def _new_thread(tid: str) -> dict:
@@ -485,6 +561,11 @@ def _seed(conn, query: str, agent: str = "", threads=None) -> dict:
             seed[r[0]] = max(seed.get(r[0], 0.0), CONCEPT_SEED * (r[1] or 0.0))
     except sqlite3.Error:
         pass  # pre-Phase-2 cache without the concepts table; next build() adds it
+    # procedural memory: a procedure is injected ONLY when its trigger matches the current
+    # situation (intent query + the live open loops), not always-on like a concept — "last
+    # time this worked: …". Scaled by outcome_score (v4 Phase 3 §5.2).
+    for pid, score in _matched_procedures(conn, query).items():
+        seed[pid] = max(seed.get(pid, 0.0), PROCEDURE_SEED * score)
     # role-biased seeding: lift nodes matching this agent's focus types. ADDITIVE
     # overlay (not max) so the role actually reweights the window above the shared
     # floors (active-thread 0.5, unresolved 0.9); spreading is still over the full graph.
@@ -522,6 +603,28 @@ def _seed(conn, query: str, agent: str = "", threads=None) -> dict:
                         (f"%{query}%",)):
                     seed[r[0]] = max(seed.get(r[0], 0.0), 0.7)
     return seed
+
+
+def _matched_procedures(conn, query: str = "") -> dict:
+    """Procedures whose `trigger` matches the current situation (v4 Phase 3 §5.2).
+
+    The situation is the intent query plus every live (unresolved) open loop's body.
+    Returns {procedure_id: outcome_score} for the matches — the gate that makes procedural
+    memory trigger-driven ("last time this worked: …") rather than always-on like semantic
+    memory. Empty (and silent) on a pre-Phase-3 cache without the procedures table."""
+    matched: dict = {}
+    try:
+        situation = (query or "").lower()
+        for r in conn.execute("SELECT body FROM nodes WHERE unresolved=1"):
+            situation += " " + (r[0] or "").lower()
+        for r in conn.execute(
+                "SELECT procedure_id, trigger, outcome_score FROM procedures"):
+            terms = [t.strip().lower() for t in (r[1] or "").split(",") if t.strip()]
+            if terms and any(t in situation for t in terms):
+                matched[r[0]] = r[2] or 0.0
+    except sqlite3.Error:
+        pass  # pre-Phase-3 cache without the procedures table; next build() adds it
+    return matched
 
 
 def _eid_for_seq(conn, seq):
@@ -724,8 +827,9 @@ class WorkingMemory:
     artifact. V4 Phase 1 promotes it to a first-class runtime object: it is built once
     from the graph, then `mutate()`d incrementally as new events land (no full
     re-synthesis), `reprioritize()`d within a fixed budget, and `render()`ed to markdown
-    only for export/debug. `concepts`/`procedures` are reserved for Phases 2/3 and stay
-    empty here (absent ⇒ current behavior, per the backward-compat invariant)."""
+    only for export/debug. `concepts` (Phase 2) and `procedures` (Phase 3) carry the
+    in-scope semantic/procedural memory; both stay empty for brains that have formed none,
+    so absent ⇒ current behavior, per the backward-compat invariant."""
 
     def __init__(self, budget: int = WORKING_MEMORY_BUDGET_CHARS,
                  query: str = "", agent: str = ""):
@@ -740,6 +844,7 @@ class WorkingMemory:
         self._nodes: dict = {}        # event_id -> node detail row
         self._th_meta: dict = {}      # thread_id -> threads-table row
         self._concept_meta: dict = {} # concept_id -> concepts-table row
+        self._procedure_meta: dict = {}  # procedure_id -> procedures-table row
         self._resurfaced: set = set()
         self._contradictions: list = []
 
@@ -754,6 +859,16 @@ class WorkingMemory:
         wm._th_meta = {r["thread_id"]: dict(r) for r in conn.execute("SELECT * FROM threads")}
         wm._concept_meta = {r["concept_id"]: dict(r)
                             for r in conn.execute("SELECT * FROM concepts")}
+        try:
+            wm._procedure_meta = {r["procedure_id"]: dict(r)
+                                  for r in conn.execute("SELECT * FROM procedures")}
+        except sqlite3.Error:
+            wm._procedure_meta = {}   # pre-Phase-3 cache; rebuilt on next build()
+        # procedural memory is trigger-gated: only procedures whose trigger matches the
+        # current situation are eligible to surface (even if a procedure node spread-
+        # activated from its evidence episodes). This is what distinguishes "how-to" recall
+        # from always-on semantic recall.
+        triggered = set(_matched_procedures(conn, query))
         conn.close()
         for n in sg["nodes"]:
             wm._nodes[n["event_id"]] = n
@@ -761,6 +876,9 @@ class WorkingMemory:
             # in-scope semantic memory: active concept nodes feed WorkingMemory.concepts
             if n["layer"] == "semantic" and n["event_id"] in wm._concept_meta:
                 wm.concepts.append(n["event_id"])
+            # in-scope procedural memory: a trigger-matched procedure node feeds .procedures
+            if n["layer"] == "procedural" and n["event_id"] in triggered:
+                wm.procedures.append(n["event_id"])
         wm.threads = dict(sg["threads"])
         wm._resurfaced = set(sg["resurfaced"])
         wm._contradictions = list(sg["contradictions"])
@@ -840,6 +958,22 @@ class WorkingMemory:
                 m = self._concept_meta[cid]
                 L.append(f"- {cid}: {(m['summary'] or '')[:90]} "
                          f"(support {m['support']}, salience {m['salience']:.2f})")
+            L.append("")
+        # procedural memory in scope (v4 Phase 3). Trigger-matched how-to knowledge —
+        # "last time this worked: …". Omitted when empty so pre-procedure brains render
+        # byte-for-byte unchanged.
+        active_procs = [p for p in self.procedures if p in self._procedure_meta]
+        if active_procs:
+            ranked_p = sorted(active_procs,
+                              key=lambda p: self.active.get(p, 0.0), reverse=True)[:3]
+            L.append("## Procedures (applicable how-to)")
+            for pid in ranked_p:
+                m = self._procedure_meta[pid]
+                L.append(f"- {pid}: {(m['label'] or '')[:90]} "
+                         f"(outcome {m['outcome_score']:.2f}, uses {m['uses']})")
+                steps = [s for s in (m["steps"] or "").split("\n") if s]
+                for s in steps[:5]:
+                    L.append(f"    • {s[:100]}")
             L.append("")
         if self._contradictions:
             L.append("## Live tension (competing hypotheses)")

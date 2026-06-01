@@ -32,6 +32,8 @@ Subcommands:
                                            (dry-run unless --apply)
     python reflect.py abstract [--apply]   T2: form concepts from recurring episodes
                                            (semantic memory; dry-run unless --apply)
+    python reflect.py learn [--apply]      T2: learn procedures from recurring successful
+                                           workflows (procedural memory; dry-run unless --apply)
     python reflect.py all                  reflect + compress
 
 Pure stdlib. Reuses cognition.build (graph) and runtime.append (truth log).
@@ -326,6 +328,124 @@ def abstract(apply: bool = False, quiet: bool = False) -> dict:
     return {"proposals": proposals, "applied": applied}
 
 
+# ─── T2 consolidation: procedure learning (§5.2, §10 T2) ─────────────────────
+
+PROC_MIN_SUPPORT = 2   # a workflow must recur across >= this many distinct SUCCESSFUL
+                       # threads (each closing a loop) to be learned as a procedure
+PROC_MAX_NEW = 8       # cap procedures learned per pass (entropy bound, §9)
+PROC_MIN_STEPS = 2     # a procedure is a sequence — at least two ordered steps
+# execution/decision node types that constitute an actionable workflow step
+PROC_STEP_TYPES = {"command", "artifact", "api_call", "decision"}
+# node types describing the SITUATION a workflow addresses (its trigger cue)
+PROC_TRIGGER_TYPES = {"objective", "open_loop", "error"}
+
+
+def _lead(body: str) -> str:
+    """Leading significant term of a step body (the step's signature token)."""
+    for w in _WORD.findall((body or "").lower()):
+        if w not in _STOPWORDS:
+            return w
+    return ""
+
+
+def learn(apply: bool = False, quiet: bool = False) -> dict:
+    """T2 procedure learning: distill recurring SUCCESSFUL workflows into procedures (§5.2).
+
+    Deterministic, stdlib-only. A procedure is a workflow that *worked*: we consider only
+    threads that reached a `loop_closed` (the success signal), take their ordered actionable
+    steps (command/artifact/api_call/decision), and signature each thread by the sequence of
+    its steps' leading terms. A signature recurring across >= PROC_MIN_SUPPORT distinct
+    successful threads becomes a procedure — its `trigger` drawn from those threads'
+    objective/open_loop/error cues, its `steps` from a representative run, its evidence the
+    contributing episodes. Idempotent — procedures already in the graph are skipped. Dry-run
+    by default; --apply emits `procedure_learned` (agent="memory" — the curator owns
+    procedural memory, §9). Append-only; `cognition._build_procedures` projects it."""
+    conn = _graph()
+    existing = {r["procedure_id"] for r in conn.execute(
+        "SELECT procedure_id FROM procedures")}
+    success = {r["thread_id"] for r in conn.execute(
+        "SELECT m.thread_id FROM nodes n JOIN membership m ON n.event_id=m.event_id "
+        "WHERE n.type='loop_closed'")}
+    step_ph = ",".join("?" * len(PROC_STEP_TYPES))
+    steps = [dict(r) for r in conn.execute(
+        f"SELECT n.event_id, n.seq, n.type, n.body, m.thread_id "
+        f"FROM nodes n JOIN membership m ON n.event_id=m.event_id "
+        f"WHERE n.type IN ({step_ph}) ORDER BY m.thread_id, n.seq",
+        list(PROC_STEP_TYPES))]
+    trig_ph = ",".join("?" * len(PROC_TRIGGER_TYPES))
+    cues = [dict(r) for r in conn.execute(
+        f"SELECT n.body, m.thread_id FROM nodes n "
+        f"JOIN membership m ON n.event_id=m.event_id "
+        f"WHERE n.type IN ({trig_ph})", list(PROC_TRIGGER_TYPES))]
+    conn.close()
+
+    by_thread, cues_by_thread = {}, {}
+    for r in steps:
+        if r["thread_id"] in success:
+            by_thread.setdefault(r["thread_id"], []).append(r)
+    for r in cues:
+        cues_by_thread.setdefault(r["thread_id"], []).append(r["body"] or "")
+
+    # group successful threads by their step-sequence signature
+    groups: dict = {}
+    for tid, ts in by_thread.items():
+        if len(ts) < PROC_MIN_STEPS:
+            continue
+        sig = tuple(_lead(s["body"]) for s in ts)
+        if not all(sig):
+            continue
+        g = groups.setdefault(sig, {"threads": set(), "evidence": set(),
+                                    "repr": ts, "triggers": set()})
+        g["threads"].add(tid)
+        g["evidence"].update(s["event_id"] for s in ts)
+        for body in cues_by_thread.get(tid, []):
+            g["triggers"].update(_terms(body))
+
+    ranked = sorted(
+        [(sig, g) for sig, g in groups.items()
+         if len(g["threads"]) >= PROC_MIN_SUPPORT],
+        key=lambda kv: (-len(kv[1]["threads"]), kv[0]))
+
+    proposals = []
+    for sig, g in ranked:
+        pid = f"prc_{_slug('-'.join(sig))}"
+        if pid in existing:
+            continue
+        steps_desc = [f"{s['type']}: {(s['body'] or '')[:80]}" for s in g["repr"]]
+        triggers = sorted(g["triggers"]) or [sig[0]]
+        proposals.append({
+            "procedure_id": pid,
+            "label": "workflow: " + " → ".join(sig),
+            "trigger": triggers,
+            "steps": steps_desc,
+            "evidence": sorted(g["evidence"]),
+            "support": len(g["threads"]),
+        })
+        if len(proposals) >= PROC_MAX_NEW:
+            break
+
+    applied = []
+    if apply and proposals:
+        import runtime
+        for p in proposals:
+            runtime.append("procedure_learned", agent="memory", **p)
+            applied.append(p["procedure_id"])
+
+    if not quiet:
+        if not proposals:
+            print(f"  no new procedures (min support {PROC_MIN_SUPPORT} "
+                  "successful threads)")
+        elif apply:
+            print(f"  learned {len(applied)} procedure(s): {', '.join(applied)}")
+        else:
+            print(f"  dry-run: {len(proposals)} candidate procedure(s). "
+                  "Re-run with --apply to learn them:")
+            for p in proposals:
+                print(f"    {p['procedure_id']}  (support {p['support']}, "
+                      f"{len(p['steps'])} steps)")
+    return {"proposals": proposals, "applied": applied}
+
+
 # ─── compression: thread digests (§9; replaces session snapshots) ────────────
 
 def _thread_digest(conn, tid: str) -> str:
@@ -432,6 +552,8 @@ def main(argv):
         resolve(apply="--apply" in rest, quiet="--quiet" in rest); return 0
     if cmd == "abstract":
         abstract(apply="--apply" in rest, quiet="--quiet" in rest); return 0
+    if cmd == "learn":
+        learn(apply="--apply" in rest, quiet="--quiet" in rest); return 0
     if cmd == "digest":
         if not rest:
             print("usage: reflect.py digest <thread_id>"); return 2
