@@ -75,7 +75,9 @@ REINFORCE_CAP = 0.30   # ceiling on cumulative reinforcement (avoids runaway)
 REINFORCE_TOP_N = 3    # how many focus nodes get an `attended` event on reinforce
 
 EDGE_WEIGHT = {"causal": 1.0, "membership": 0.7, "thread_rel": 0.4,
+               "concept": 0.6,        # v4 Phase 2: concept <-> evidence episode (semantic recall)
                "contradiction": 0.0}  # contradiction handled by inhibition, not spread
+CONCEPT_SEED = 0.55       # v4 Phase 2: in-scope concepts seed attention (scaled by salience)
 
 # ── multi-agent attention windows (ARCHITECTURE_V3.md §9) ────────────────────
 # Each agent computes its OWN attention over the ONE shared graph: same engine,
@@ -198,21 +200,39 @@ CREATE TABLE thread_activation (
     PRIMARY KEY (agent, thread_id)
 );
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+-- v4 Phase 2 semantic memory: durable concepts + their evidence back to episodes.
+CREATE TABLE concepts (
+    concept_id TEXT PRIMARY KEY, summary TEXT, salience REAL,
+    support INTEGER DEFAULT 0, formed_t TEXT
+);
+CREATE TABLE concept_evidence (concept_id TEXT, event_id TEXT);
 CREATE INDEX ix_mem_thread ON membership(thread_id);
 CREATE INDEX ix_edges_dst ON edges(dst);
 CREATE INDEX ix_edges_src ON edges(src);
+CREATE INDEX ix_cev_concept ON concept_evidence(concept_id);
 """
+
+# Bump when the cache SCHEMA or its projection logic changes so an older cognition.db
+# never silently satisfies the watermark skip (forces one rebuild). Phase 2 added the
+# concepts/concept_evidence tables and the `concept` edge.
+SCHEMA_VERSION = 2
 
 
 def _build_watermark(db_path: Path) -> int:
     """Event count the current cognition.db was built from, or -1 if unknown/stale.
 
-    Returns -1 (forcing a rebuild) whenever the DB is missing or predates the v4
-    `meta` table, so an older cache never silently satisfies the watermark check."""
+    Returns -1 (forcing a rebuild) whenever the DB is missing, predates the v4
+    `meta` table, or was built under an older SCHEMA_VERSION, so an older cache never
+    silently satisfies the watermark check."""
     if not db_path.exists():
         return -1
     try:
         conn = sqlite3.connect(db_path)
+        ver = conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        if not ver or int(ver[0]) != SCHEMA_VERSION:
+            conn.close()
+            return -1
         row = conn.execute(
             "SELECT value FROM meta WHERE key='event_count'").fetchone()
         conn.close()
@@ -339,20 +359,74 @@ def build(db_path: Path = COG_DB, force: bool = False) -> dict:
             (tid, th["title"], th["opened_t"], th["last_activity_t"],
              th["status"], th["merged_into"], th["n_events"]))
 
-    # watermark: record the event count this build is a projection of (v4 Phase 0)
+    # v4 Phase 2: materialize semantic memory from concept_formed events (curator truth).
+    _build_concepts(conn, events)
+
+    # watermark: record the event count + schema version this build is a projection of.
     conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('event_count',?)",
                  (str(len(events)),))
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",
+                 (str(SCHEMA_VERSION),))
     conn.commit()
     summary = {
         "events": len(events),
         "nodes": conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0],
         "threads": len(threads),
         "edges": conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
+        "concepts": conn.execute("SELECT COUNT(*) FROM concepts").fetchone()[0],
         "skipped": False,
     }
     conn.close()
     _export_threads(summary)
     return summary
+
+
+def _concept_id_of(e: dict) -> str:
+    return e.get("concept_id") or e.get("id") or ""
+
+
+def _build_concepts(conn, events: list) -> None:
+    """Project `concept_formed` events into semantic memory (v4 Phase 2 §5.1).
+
+    Concepts are curator-emitted truth: each event names a concept, a one-line summary,
+    and the evidence episodes it abstracts. Replaying in order accumulates support and
+    evidence (a later `concept_formed` for the same id reinforces it). Each concept is
+    ALSO materialized as a graph node (type='concept', layer='semantic') wired to its
+    evidence by `concept` edges, so spreading activation flows episode<->meaning and the
+    concept can seed/surface in working memory. Truth stays in the log; this is a pure
+    projection — absent concept_formed events ⇒ empty semantic memory (current behavior)."""
+    acc: dict = {}   # concept_id -> {summary, salience, support, evidence:set, formed_t}
+    for e in events:
+        if e.get("type") != "concept_formed":
+            continue
+        cid = _concept_id_of(e)
+        if not cid:
+            continue
+        ev = _as_list(e.get("evidence"))
+        c = acc.setdefault(cid, {"summary": "", "salience": 0.0, "support": 0,
+                                 "evidence": set(), "formed_t": e.get("t")})
+        c["summary"] = e.get("summary") or e.get("msg") or c["summary"] or cid
+        c["evidence"].update(ev)
+        # support: explicit, else cumulative distinct evidence count; reinforces over time.
+        c["support"] = int(e.get("support", max(len(c["evidence"]), c["support"] + 1)))
+        if e.get("salience") is not None:
+            c["salience"] = float(e["salience"])
+    for cid, c in acc.items():
+        sal = c["salience"] or round(min(0.9, 0.4 + 0.1 * c["support"]), 4)
+        conn.execute(
+            "INSERT OR REPLACE INTO concepts(concept_id,summary,salience,support,formed_t)"
+            " VALUES (?,?,?,?,?)", (cid, c["summary"], sal, c["support"], c["formed_t"]))
+        # concept node so it participates in attention / working memory
+        conn.execute(
+            "INSERT OR REPLACE INTO nodes"
+            "(event_id,seq,t,type,layer,body,importance,unresolved,reinforced)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (cid, None, c["formed_t"], "concept", "semantic",
+             c["summary"], sal, 0, 0))
+        for eid in c["evidence"]:
+            conn.execute("INSERT INTO concept_evidence VALUES (?,?)", (cid, eid))
+            conn.execute("INSERT INTO edges VALUES (?,?,?,?)",
+                         (cid, eid, "concept", EDGE_WEIGHT["concept"]))
 
 
 def _new_thread(tid: str) -> dict:
@@ -404,6 +478,13 @@ def _seed(conn, query: str, agent: str = "", threads=None) -> dict:
         for r in conn.execute(
                 f"SELECT event_id FROM membership WHERE thread_id IN ({q})", active):
             seed[r[0]] = max(seed.get(r[0], 0.0), 0.5)
+    # in-scope semantic memory: concepts seed attention scaled by salience, so durable
+    # meaning resurfaces even when the originating episodes have cooled (v4 Phase 2 §5.1).
+    try:
+        for r in conn.execute("SELECT concept_id, salience FROM concepts"):
+            seed[r[0]] = max(seed.get(r[0], 0.0), CONCEPT_SEED * (r[1] or 0.0))
+    except sqlite3.Error:
+        pass  # pre-Phase-2 cache without the concepts table; next build() adds it
     # role-biased seeding: lift nodes matching this agent's focus types. ADDITIVE
     # overlay (not max) so the role actually reweights the window above the shared
     # floors (active-thread 0.5, unresolved 0.9); spreading is still over the full graph.
@@ -658,6 +739,7 @@ class WorkingMemory:
         # detail backing render(), keyed for O(1) incremental mutation
         self._nodes: dict = {}        # event_id -> node detail row
         self._th_meta: dict = {}      # thread_id -> threads-table row
+        self._concept_meta: dict = {} # concept_id -> concepts-table row
         self._resurfaced: set = set()
         self._contradictions: list = []
 
@@ -670,10 +752,15 @@ class WorkingMemory:
         conn = sqlite3.connect(COG_DB)
         conn.row_factory = sqlite3.Row
         wm._th_meta = {r["thread_id"]: dict(r) for r in conn.execute("SELECT * FROM threads")}
+        wm._concept_meta = {r["concept_id"]: dict(r)
+                            for r in conn.execute("SELECT * FROM concepts")}
         conn.close()
         for n in sg["nodes"]:
             wm._nodes[n["event_id"]] = n
             wm.active[n["event_id"]] = n["activation"]
+            # in-scope semantic memory: active concept nodes feed WorkingMemory.concepts
+            if n["layer"] == "semantic" and n["event_id"] in wm._concept_meta:
+                wm.concepts.append(n["event_id"])
         wm.threads = dict(sg["threads"])
         wm._resurfaced = set(sg["resurfaced"])
         wm._contradictions = list(sg["contradictions"])
@@ -742,6 +829,18 @@ class WorkingMemory:
         if not cognitive:
             L.append("(no cognitive nodes active)")
         L.append("")
+        # semantic memory in scope (v4 Phase 2). Section omitted when empty so the
+        # rendered lens is byte-for-byte unchanged for pre-concept brains.
+        active_concepts = [c for c in self.concepts if c in self._concept_meta]
+        if active_concepts:
+            ranked_c = sorted(active_concepts,
+                              key=lambda c: self.active.get(c, 0.0), reverse=True)[:5]
+            L.append("## Concepts in scope (semantic memory)")
+            for cid in ranked_c:
+                m = self._concept_meta[cid]
+                L.append(f"- {cid}: {(m['summary'] or '')[:90]} "
+                         f"(support {m['support']}, salience {m['salience']:.2f})")
+            L.append("")
         if self._contradictions:
             L.append("## Live tension (competing hypotheses)")
             for a, b, sa, sb in self._contradictions:

@@ -59,13 +59,15 @@ KNOWN_TYPES = {
     # v3 cognition-native additions (ARCHITECTURE_V3.md)
     "observation", "hypothesis", "contradiction", "output", "api_call",
     "command", "thread_open", "thread_merge", "thread_split", "attended",
+    # v4 Phase 2 semantic memory: the memory curator consolidates episodes into concepts
+    "concept_formed",
 }
 
 # v3: cognitive vs execution vs meta layer, inferred from type when not given (§4).
 COGNITIVE_TYPES = {
     "objective", "decision", "observation", "reflection", "hypothesis",
     "contradiction", "assumption", "assumption_invalidated", "open_loop",
-    "loop_closed", "topic_shift",
+    "loop_closed", "topic_shift", "concept_formed",
 }
 EXECUTION_TYPES = {"artifact", "output", "api_call", "error", "command"}
 

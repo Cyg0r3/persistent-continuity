@@ -405,9 +405,18 @@ cognition**, then **scale-out**.
 > demoted to export only. Covered by `tests/test_phase1_working_memory.py` (4 tests).
 > *Outcome: markdown is fully demoted to export; live reprioritization within budget.*
 
-> **Phase 2 — Semantic memory.**
-> Add `concepts`/`concept_evidence`, the `concept` edge, the `concept_formed` event, and the T2
-> abstraction pass. Concepts join attention seeding. *Outcome: meaning persists after episodes cool.*
+> **Phase 2 — Semantic memory. ✅ BUILT.**
+> Added the `concepts`/`concept_evidence` tables and the `concept` edge to the graph schema
+> (gated by a new `meta.schema_version` so pre-Phase-2 caches rebuild instead of skipping),
+> the `concept_formed` event (curator-emitted, agent="memory"), and the **T2 abstraction
+> pass** (`reflect.py abstract`): a deterministic, stdlib-only clustering of recurring
+> episodic terms into durable concepts (dry-run by default, `--apply` to form, idempotent).
+> `cognition._build_concepts` projects those events into semantic memory — each concept is
+> also materialized as a graph node (`type='concept'`, `layer='semantic'`) wired to its
+> evidence episodes, so concepts **seed attention** (scaled by salience) and surface in
+> `WorkingMemory.concepts` + the rendered lens. Concept-free brains render byte-for-byte as
+> before. Covered by `tests/test_phase2_semantic.py` (5 tests).
+> *Outcome: meaning persists after episodes cool.*
 
 > **Phase 3 — Procedural memory.**
 > Add `procedures`, the `procedure_learned` event, trigger-matched injection into working memory, and
