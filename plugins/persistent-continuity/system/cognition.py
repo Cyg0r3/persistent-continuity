@@ -215,6 +215,12 @@ CREATE TABLE procedures (
     outcome_score REAL DEFAULT 0.5, uses INTEGER DEFAULT 0, last_used_t TEXT
 );
 CREATE TABLE procedure_evidence (procedure_id TEXT, event_id TEXT);
+-- v4 Phase 4 persistent hybrid retrieval: one persisted embedding per node so query-time
+-- candidate generation is a single query-embed + nearest-neighbour scan over `vec`
+-- (instead of re-encoding the whole corpus every call). `model` tags the embedder that
+-- produced the vectors; `vec` is JSON (dense float list, or sparse {token: weight} for
+-- the stdlib TF-IDF default). Empty/absent ⇒ retrieval falls back to BM25 then lexical.
+CREATE TABLE vectors (event_id TEXT PRIMARY KEY, model TEXT, dim INTEGER, vec TEXT);
 CREATE INDEX ix_mem_thread ON membership(thread_id);
 CREATE INDEX ix_edges_dst ON edges(dst);
 CREATE INDEX ix_edges_src ON edges(src);
@@ -225,8 +231,9 @@ CREATE INDEX ix_pev_procedure ON procedure_evidence(procedure_id);
 # Bump when the cache SCHEMA or its projection logic changes so an older cognition.db
 # never silently satisfies the watermark skip (forces one rebuild). Phase 2 added the
 # concepts/concept_evidence tables and the `concept` edge; Phase 3 added the
-# procedures/procedure_evidence tables and the `procedure` edge.
-SCHEMA_VERSION = 3
+# procedures/procedure_evidence tables and the `procedure` edge; Phase 4 added the
+# `vectors` table (persisted embeddings for hybrid retrieval).
+SCHEMA_VERSION = 4
 
 
 def _build_watermark(db_path: Path) -> int:
@@ -374,6 +381,8 @@ def build(db_path: Path = COG_DB, force: bool = False) -> dict:
     _build_concepts(conn, events)
     # v4 Phase 3: materialize procedural memory from procedure_learned events.
     _build_procedures(conn, events)
+    # v4 Phase 4: persist one embedding per node so retrieval is a stored-vector scan.
+    _build_vectors(conn)
 
     # watermark: record the event count + schema version this build is a projection of.
     conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('event_count',?)",
@@ -388,6 +397,7 @@ def build(db_path: Path = COG_DB, force: bool = False) -> dict:
         "edges": conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
         "concepts": conn.execute("SELECT COUNT(*) FROM concepts").fetchone()[0],
         "procedures": conn.execute("SELECT COUNT(*) FROM procedures").fetchone()[0],
+        "vectors": conn.execute("SELECT COUNT(*) FROM vectors").fetchone()[0],
         "skipped": False,
     }
     conn.close()
@@ -582,14 +592,13 @@ def _seed(conn, query: str, agent: str = "", threads=None) -> dict:
         for r in conn.execute(
                 f"SELECT event_id FROM membership WHERE thread_id IN ({q})", assigned):
             seed[r[0]] = seed.get(r[0], 0.0) + ASSIGNED_THREAD_BOOST
-    # query relevance: dense (if enabled) -> BM25 -> lexical LIKE. Graceful 3-tier chain.
+    # query relevance: persisted vectors (v4 Phase 4) -> BM25 -> lexical LIKE. Graceful
+    # 3-tier chain. The vector tier scans the embeddings stored at build() rather than
+    # re-encoding the corpus, so it is cheap and the same path serves dense and stdlib.
     if query:
-        dense = []
-        if _EMBEDDER.available():
-            rows = conn.execute("SELECT event_id, body FROM nodes").fetchall()
-            dense = _EMBEDDER.rank(query, [r[0] for r in rows], [r[1] or "" for r in rows])
-        if dense:
-            for eid, sim in dense:
+        hits = _vector_search(conn, query, k=VECTOR_TOPK)
+        if hits:
+            for eid, sim in hits:
                 seed[eid] = max(seed.get(eid, 0.0), 0.6 + 0.4 * sim)
         else:
             try:
@@ -632,45 +641,186 @@ def _eid_for_seq(conn, seq):
     return r[0] if r else None
 
 
-# ─── optional dense embedder (off by default; pluggable Embedder interface) ──
+# ─── persistent hybrid retrieval (v4 Phase 4 §11) ───────────────────────────
+#
+# Embeddings are computed ONCE at build() and persisted in the `vectors` table, so a
+# query only embeds itself and scans the stored vectors (nearest-neighbour) — the graph
+# still decides, the vectors just accelerate candidate generation. Two backends share
+# one persisted format and one query path:
+#   • stdlib default — a deterministic TF-IDF sparse vector (no dependency); cosine over
+#     it is associative term-overlap recall, strictly better than substring LIKE.
+#   • dense upgrade  — sentence-transformers float vectors when CONTINUITY_DENSE is set
+#     AND the package is installed.
+# Either way, if no usable vectors exist (empty table, or dense vectors but the model is
+# unavailable at query time) the chain degrades cleanly to BM25, then lexical LIKE.
+
+DENSE_PREFIX = "st:"            # model tag prefix for dense (sentence-transformers) vectors
+LEXICAL_MODEL = "lexical-tfidf"  # model tag for the stdlib default vectors
+VECTOR_TOPK = 8                # candidates a vector scan contributes to the seed
+
 
 class _Embedder:
-    """Pluggable dense embedder for semantic seeding (ARCHITECTURE_V3.md §5).
+    """Pluggable DENSE embedder (ARCHITECTURE_V3.md §5; v4 Phase 4).
 
     OFF by default — enabled only when CONTINUITY_DENSE is truthy AND
-    sentence-transformers is installed. Anthropic has no embeddings endpoint, so
-    dense is a local-model upgrade; when absent, attention seeding falls back to
-    BM25 (then lexical LIKE). This keeps the stdlib-default invariant intact."""
+    sentence-transformers is installed. Anthropic has no embeddings endpoint, so dense is
+    a local-model upgrade; when absent, _build_vectors persists stdlib TF-IDF vectors and
+    retrieval still works. This keeps the stdlib-default invariant intact."""
 
     def __init__(self):
         self.model = None
+        self.name = os.environ.get("CONTINUITY_EMBED_MODEL", "all-MiniLM-L6-v2")
         if os.environ.get("CONTINUITY_DENSE", "").lower() in ("1", "true", "yes"):
             try:
                 from sentence_transformers import SentenceTransformer
-                name = os.environ.get("CONTINUITY_EMBED_MODEL", "all-MiniLM-L6-v2")
-                self.model = SentenceTransformer(name)
+                self.model = SentenceTransformer(self.name)
             except Exception:
-                self.model = None  # not installed / load failed -> graceful BM25 fallback
+                self.model = None  # not installed / load failed -> stdlib TF-IDF vectors
 
     def available(self) -> bool:
         return self.model is not None
 
-    def rank(self, query: str, ids: list, texts: list) -> list:
-        """Return [(event_id, similarity in [0,1])] for the top matches, or []."""
-        if not self.available() or not ids:
+    def model_tag(self) -> str:
+        return DENSE_PREFIX + self.name
+
+    def encode(self, texts: list) -> list:
+        """Return a normalized float vector (list) per text, or [] on any failure."""
+        if not self.available() or not texts:
             return []
         try:
-            import numpy as np
-            vecs = self.model.encode([query] + texts, normalize_embeddings=True)
-            q, mat = vecs[0], np.array(vecs[1:])
-            sims = mat @ q  # cosine (vectors are normalized)
-            order = sims.argsort()[::-1][:8]
-            return [(ids[i], float((sims[i] + 1) / 2)) for i in order]
+            vecs = self.model.encode(list(texts), normalize_embeddings=True)
+            return [[round(float(x), 6) for x in row] for row in vecs]
         except Exception:
             return []
 
 
 _EMBEDDER = _Embedder()  # singleton; cheap when disabled
+
+
+def _vec_tokenize(text: str) -> list:
+    """Tokenizer for the stdlib TF-IDF backend: reuse semantic_search.tokenize
+    (lowercase, depunctuate, drop stopwords) with a minimal inline fallback."""
+    try:
+        from semantic_search import tokenize
+        return tokenize(text or "")
+    except Exception:
+        return [w for w in "".join(c if c.isalnum() else " "
+                for c in (text or "").lower()).split() if len(w) > 1]
+
+
+def _lexical_tfidf(texts: list):
+    """Build deterministic L2-normalized TF-IDF sparse vectors (pure stdlib).
+    Returns (idf, vecs) where idf is {token: weight} and each vec is {token: weight}."""
+    docs = [_vec_tokenize(t) for t in texts]
+    n = max(len(docs), 1)
+    df: dict = {}
+    for toks in docs:
+        for tok in set(toks):
+            df[tok] = df.get(tok, 0) + 1
+    idf = {tok: math.log(n / (c + 1)) + 1.0 for tok, c in df.items()}
+    vecs = []
+    for toks in docs:
+        tf: dict = {}
+        for tok in toks:
+            tf[tok] = tf.get(tok, 0) + 1
+        total = sum(tf.values()) or 1
+        raw = {tok: (c / total) * idf[tok] for tok, c in tf.items()}
+        norm = math.sqrt(sum(w * w for w in raw.values()))
+        vecs.append({tok: round(w / norm, 6) for tok, w in raw.items()} if norm else {})
+    return idf, vecs
+
+
+def _build_vectors(conn) -> None:
+    """Persist one embedding per node into `vectors` (v4 Phase 4). Prefers the dense
+    backend when enabled+installed; otherwise stores stdlib TF-IDF vectors. The idf
+    needed to embed a query against TF-IDF vectors is kept in meta so query-time embedding
+    needs no corpus re-scan. A pure projection — re-derivable from the node bodies."""
+    rows = conn.execute("SELECT event_id, body FROM nodes ORDER BY event_id").fetchall()
+    if not rows:
+        return
+    ids = [r[0] for r in rows]
+    texts = [r[1] or "" for r in rows]
+
+    dense = _EMBEDDER.encode(texts) if _EMBEDDER.available() else []
+    if dense and len(dense) == len(ids):
+        tag = _EMBEDDER.model_tag()
+        for eid, v in zip(ids, dense):
+            conn.execute("INSERT OR REPLACE INTO vectors VALUES (?,?,?,?)",
+                         (eid, tag, len(v), json.dumps(v)))
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('vector_model',?)", (tag,))
+        conn.execute("DELETE FROM meta WHERE key='vector_idf'")
+        return
+
+    idf, vecs = _lexical_tfidf(texts)
+    for eid, v in zip(ids, vecs):
+        conn.execute("INSERT OR REPLACE INTO vectors VALUES (?,?,?,?)",
+                     (eid, LEXICAL_MODEL, len(v), json.dumps(v, separators=(",", ":"))))
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('vector_model',?)",
+                 (LEXICAL_MODEL,))
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('vector_idf',?)",
+                 (json.dumps(idf, separators=(",", ":")),))
+
+
+def _vector_search(conn, query: str, k: int = VECTOR_TOPK) -> list:
+    """Nearest-neighbour scan over persisted `vectors` (v4 Phase 4 candidate generation).
+
+    Returns [(event_id, similarity in [0,1])] for the top matches, or [] to signal the
+    caller to fall back to BM25/lexical. Returns [] when there are no vectors, when the
+    stored vectors are dense but the matching model is unavailable now, or when the query
+    shares no in-vocabulary terms — every degradation is silent."""
+    if not query:
+        return []
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key='vector_model'").fetchone()
+    except sqlite3.Error:
+        return []  # pre-Phase-4 cache without the meta key; next build() populates it
+    model = row[0] if row else None
+    if not model:
+        return []
+
+    scored = []
+    if model.startswith(DENSE_PREFIX):
+        # dense vectors are only readable with the same model loaded at query time.
+        if not _EMBEDDER.available() or _EMBEDDER.model_tag() != model:
+            return []
+        qv = _EMBEDDER.encode([query])
+        if not qv:
+            return []
+        q = qv[0]
+        for eid, vec in conn.execute("SELECT event_id, vec FROM vectors"):
+            try:
+                v = json.loads(vec)
+            except (TypeError, ValueError):
+                continue
+            sim = sum(a * b for a, b in zip(q, v))  # cosine (vectors normalized)
+            scored.append((eid, (sim + 1.0) / 2.0))  # map [-1,1] -> [0,1]
+    else:
+        irow = conn.execute("SELECT value FROM meta WHERE key='vector_idf'").fetchone()
+        if not irow:
+            return []
+        idf = json.loads(irow[0])
+        toks = _vec_tokenize(query)
+        tf: dict = {}
+        for tok in toks:
+            if tok in idf:
+                tf[tok] = tf.get(tok, 0) + 1
+        total = sum(tf.values()) or 1
+        raw = {tok: (c / total) * idf[tok] for tok, c in tf.items()}
+        norm = math.sqrt(sum(w * w for w in raw.values()))
+        if not norm:
+            return []
+        q = {tok: w / norm for tok, w in raw.items()}
+        for eid, vec in conn.execute("SELECT event_id, vec FROM vectors"):
+            try:
+                v = json.loads(vec)
+            except (TypeError, ValueError):
+                continue
+            sim = sum(q[t] * v[t] for t in q if t in v)  # cosine over shared terms
+            if sim > 0:
+                scored.append((eid, sim))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [(eid, max(0.0, min(1.0, s))) for eid, s in scored[:k] if s > 0]
 
 
 def attend(query: str = "", persist: bool = True, agent: str = "", threads=None) -> dict:
@@ -1094,8 +1244,9 @@ def main(argv):
     if cmd == "build":
         s = build(force="--force" in rest)
         verb = "up-to-date (skipped rebuild)" if s.get("skipped") else "built"
+        vecs = f", {s['vectors']} vectors" if "vectors" in s else ""
         print(f"Graph {verb} from {s['events']} events: {s['nodes']} nodes, "
-              f"{s['threads']} threads, {s['edges']} edges -> "
+              f"{s['threads']} threads, {s['edges']} edges{vecs} -> "
               f"{COG_DB.relative_to(ROOT)}")
         return 0
 

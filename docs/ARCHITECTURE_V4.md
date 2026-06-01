@@ -437,9 +437,21 @@ cognition**, then **scale-out**.
 > brains render byte-for-byte as before. Covered by `tests/test_phase3_procedural.py` (7 tests).
 > *Outcome: the system improves at how it works, not just what it knows.*
 
-> **Phase 4 — Persistent hybrid retrieval.**
-> Persist embeddings in `vectors`; wire vector ANN into candidate generation (graceful fallback to
-> BM25/lexical). *Outcome: associative recall; vectors accelerate, graph still decides.*
+> **Phase 4 — Persistent hybrid retrieval. ✅ BUILT.**
+> Added the `vectors` table to the graph schema (gated by `meta.schema_version=4` so pre-Phase-4
+> caches rebuild instead of skipping): `build()` now computes **one embedding per node and persists
+> it** (`cognition._build_vectors`), so a query embeds only *itself* and runs a nearest-neighbour
+> scan over the stored vectors instead of re-encoding the whole corpus on every call. Two backends
+> share one persisted format and one query path (`_vector_search`): the **stdlib default** is a
+> deterministic L2-normalized TF-IDF sparse vector (no dependency; its idf is persisted in `meta` so
+> query embedding needs no corpus re-scan), and the **dense upgrade** stores sentence-transformers
+> float vectors when `CONTINUITY_DENSE` is set *and* the package is installed. Vector hits seed
+> attention (`_seed`) as the first tier of a graceful chain — **persisted vectors → BM25 → lexical
+> LIKE** — so when no usable vectors exist (empty table, or dense vectors with the model unavailable
+> at query time) candidate generation degrades silently to keyword retrieval. Vectors only *accelerate*
+> and *associate*; spreading activation over the graph still decides. Covered by
+> `tests/test_phase4_hybrid.py` (8 tests). *Outcome: associative recall; vectors accelerate, graph
+> still decides.*
 
 > **Phase 5 — Consolidation pipeline + snapshots.**
 > Formalize T0/T1/T2 scheduling; add snapshot/compaction (`snapshot` event, `meta.snapshot_seq`),
