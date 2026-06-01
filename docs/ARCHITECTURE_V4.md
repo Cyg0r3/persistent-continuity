@@ -562,13 +562,26 @@ cognition**, then **scale-out**.
 > `tests/test_phase9_adaptive_procedures.py`. *Outcome: the workflows that consistently succeed get
 > stronger; the ones that fail fade.*
 
-> **Phase 10 — Meta-cognition layer. ⏳ PLANNED.**
-> A lightweight self-evaluation pass (§15): `reflect.py introspect` measures retrieval effectiveness,
-> procedural success rates, cognitive drift, context pollution, and attention instability from the
-> existing activation/thread history and procedure scores, emitting a `meta_assessment` event and a
-> `confidence` signal. It feeds strategy adaptation (e.g. widen retrieval when recall is poor, trigger
-> incubation/oscillation when fixation is detected) — bounded, single-pass, never recursive. *Outcome:
-> the system monitors its own reasoning quality and adapts, without instability.*
+> **Phase 10 — Meta-cognition layer. ✅ BUILT.**
+> A lightweight self-evaluation pass (§15): `reflect.py introspect` reads five *already-derived*
+> signals — retrieval effectiveness (hit-rate of seeded nodes the turn reinforced, `activation`⋈
+> `nodes.reinforced`), procedural success (mean reinforced `outcome_score` of executed procedures,
+> §14), cognitive drift (the Stage-4 `detect_drift` divergence, quantified), context pollution
+> (share of cold / low-activation nodes in the active window, `META_POLLUTION_FLOOR 0.05`), and
+> attention instability (a `topic_shift`-churn proxy over the recent window). It folds them into a
+> single `confidence` scalar (mean health, lower-is-better metrics inverted) and emits ONE
+> curator-owned `meta_assessment` event carrying `confidence`, per-metric readings, and declarative
+> strategy `nudges` (`widen_retrieval` / `review_procedures` / `rerun_retrieval` /
+> `trigger_compaction` / `enable_incubation`) the next pass MAY honour — never auto-mutating here.
+> Bounded and single-pass: a `meta_assessment` is never itself an input to meta-cognition (no
+> recursion). A metric with no signal reads null and is simply excluded from the fold (an empty
+> graph self-assesses to null and proposes nothing). Curator-owned in both `runtime` and
+> `cognition` arbitration sets; the assessment projects as a replayable `layer='meta'` node. Runs as
+> the final stage `[8/8]` of the `consolidate` sleep cycle (so it grades the state that cycle
+> leaves behind) and is also exposed as `reflect.py introspect [--apply]` (dry-run by default). No
+> SCHEMA_VERSION bump — the event folds through the generic node projection, so existing caches stay
+> valid. Tests: `tests/test_phase10_metacognition.py`. *Outcome: the system monitors its own
+> reasoning quality and adapts, without instability.*
 
 > **Phase 11 — Pattern-to-procedure pipeline. ⏳ PLANNED.**
 > Close the loop (§16): when a detected pattern (Phase 8) is a *successful* recurring sequence with

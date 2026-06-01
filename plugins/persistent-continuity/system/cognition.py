@@ -149,6 +149,7 @@ CURATOR_TYPES = {
     "concept_formed", "procedure_learned", "concept_retired",
     "assumption_invalidated", "loop_closed", "snapshot",
     "pattern_detected", "procedure_retired",
+    "meta_assessment",   # v4.1 Phase 10: curator self-evaluation conclusion
 }
 
 

@@ -40,8 +40,13 @@ Subcommands:
                                            (semantic memory; dry-run unless --apply)
     python reflect.py retire-procedures [--apply]  T2: retire chronically-failing procedures by
                                            reinforced outcome_score (procedural memory; §14)
+    python reflect.py introspect [--apply]  T1/T2: bounded meta-cognition — self-evaluate
+                                           reasoning quality (recall/procedural success/drift/
+                                           pollution/instability) into a `meta_assessment` +
+                                           confidence + strategy nudges (§15; dry-run unless --apply)
     python reflect.py consolidate [--apply]  T2 pipeline: abstract + learn + mine + prune +
-                                           retire-procedures + snapshot (the "sleep cycle"; dry-run unless --apply)
+                                           retire-procedures + snapshot + incubate + introspect
+                                           (the "sleep cycle"; dry-run unless --apply)
     python reflect.py all                  reflect + compress
 
 Pure stdlib. Reuses cognition.build (graph) and runtime.append (truth log).
@@ -724,6 +729,134 @@ def mine(apply: bool = False, quiet: bool = False) -> dict:
     return {"proposals": proposals, "applied": applied}
 
 
+# ─── T1/T2 meta-cognition (§15): bounded self-evaluation of reasoning quality ────
+
+# All five readings are projections of *already-derived* signals — no new sensing, no
+# recursion (a meta_assessment is never itself an input to meta-cognition). Thresholds turn
+# a poor reading into a declarative, bounded strategy nudge the next pass may honour.
+META_RECALL_FLOOR = 0.34       # retrieval effectiveness below this ⇒ widen retrieval
+META_PROC_FLOOR = 0.40         # procedural success below this ⇒ procedures underperforming
+META_POLLUTION_CEIL = 0.60     # share of cold/low-relevance active nodes above this ⇒ compact
+META_INSTABILITY_CEIL = 0.34   # topic-shift churn above this ⇒ enable incubation/oscillation
+META_POLLUTION_FLOOR = 0.05    # an activation at/below this counts as cold/low-relevance noise
+META_CHURN_WINDOW = 40         # recent-event window for the attention-instability proxy
+
+
+def _mean(xs):
+    xs = [x for x in xs if x is not None]
+    return sum(xs) / len(xs) if xs else None
+
+
+def _topic_shift_churn(window: int = META_CHURN_WINDOW):
+    """Attention-instability proxy: how often the working set jerked topics recently.
+    Rank-churn history isn't persisted, so we read it off the replayable log — the rate of
+    `topic_shift` markers in the recent window (normalized so ~1 shift / 10 events ≈ 1.0)."""
+    import runtime
+    events = runtime.read_events()
+    if not events:
+        return None
+    recent = events[-window:]
+    shifts = sum(1 for e in recent if e.get("type") == "topic_shift")
+    return round(min(1.0, shifts / max(1.0, len(recent) / 10.0)), 4)
+
+
+def introspect(apply: bool = False, quiet: bool = False, agent: str = "") -> dict:
+    """T1/T2 meta-cognition (§15): a single bounded pass that evaluates the system's own
+    reasoning quality over five already-derived signals and emits a curator `meta_assessment`
+    (a replayable projection — never a recursive input to itself):
+
+      retrieval effectiveness — hit-rate of seeded nodes the turn actually used (attention→use)
+      procedural success rate — mean reinforced `outcome_score` of executed procedures (§14)
+      cognitive drift         — Stage-4 topic divergence of the recent working set, quantified
+      context pollution       — share of cold / low-relevance nodes in the active window
+      attention instability   — topic-shift churn across the recent window (oscillation proxy)
+
+    Each metric folds into a single `confidence` scalar (mean health, 1 = good) and, when it
+    crosses a threshold, into a declarative `nudges` list the next pass may honour (widen
+    retrieval / re-run retrieval / trigger compaction / enable incubation). Dry-run by default;
+    --apply appends the one `meta_assessment` event. Metrics with no signal read as null and
+    are simply excluded from the confidence fold (back-compat: an empty graph self-assesses to
+    a null confidence and proposes nothing)."""
+    conn = _graph()
+    seeded = [dict(r) for r in conn.execute(
+        "SELECT a.event_id, a.base, a.activation, n.reinforced, n.cold "
+        "FROM activation a JOIN nodes n ON a.event_id=n.event_id WHERE a.agent=?", (agent,))]
+    # 1. retrieval effectiveness — of the nodes retrieval seeded (base>0), how many were used
+    primed = [r for r in seeded if (r["base"] or 0) > 0]
+    used = [r for r in primed if (r["reinforced"] or 0) > 0]
+    retrieval_eff = round(len(used) / len(primed), 4) if primed else None
+    # 4. context pollution — share of the active window that is cold or barely-activated noise
+    active = [r for r in seeded if (r["activation"] or 0) > 0]
+    polluted = [r for r in active
+                if (r["cold"] or 0) or (r["activation"] or 0) <= META_POLLUTION_FLOOR]
+    pollution = round(len(polluted) / len(active), 4) if active else None
+    # 2. procedural success rate — mean reinforced outcome_score of procedures actually executed
+    try:
+        scores = [r[0] for r in conn.execute(
+            "SELECT outcome_score FROM procedures WHERE uses>=1") if r[0] is not None]
+    except Exception:
+        scores = []        # pre-Phase-3 cache: no procedures table
+    proc_success = round(_mean(scores), 4) if scores else None
+    conn.close()
+    # 3. cognitive drift — reuse the Stage-4 detector (higher = more off-topic)
+    try:
+        import retrieval
+        drift = retrieval.detect_drift().get("drift")
+    except Exception:
+        drift = None
+    # 5. attention instability — topic-shift churn proxy
+    instability = _topic_shift_churn()
+
+    metrics = {
+        "retrieval_effectiveness": retrieval_eff,
+        "procedural_success": proc_success,
+        "cognitive_drift": drift,
+        "context_pollution": pollution,
+        "attention_instability": instability,
+    }
+    # fold to a single confidence (mean health, where 1 = good; lower-is-better metrics inverted)
+    health = [retrieval_eff, proc_success,
+              None if drift is None else 1.0 - min(1.0, drift),
+              None if pollution is None else 1.0 - pollution,
+              None if instability is None else 1.0 - instability]
+    conf = _mean(health)
+    confidence = round(conf, 4) if conf is not None else None
+
+    # declarative, bounded strategy nudges — what the next pass MAY do (no auto-mutation here)
+    nudges = []
+    if retrieval_eff is not None and retrieval_eff < META_RECALL_FLOOR:
+        nudges.append("widen_retrieval")        # lower seed threshold / add a lexical tier
+    if proc_success is not None and proc_success < META_PROC_FLOOR:
+        nudges.append("review_procedures")       # procedural memory underperforming
+    if drift is not None and drift >= retrieval.DRIFT_THRESHOLD:
+        nudges.append("rerun_retrieval")         # topic shifted off the established baseline
+    if pollution is not None and pollution >= META_POLLUTION_CEIL:
+        nudges.append("trigger_compaction")      # active window is cold/noisy
+    if instability is not None and instability >= META_INSTABILITY_CEIL:
+        nudges.append("enable_incubation")       # fixation/oscillation — let it settle
+
+    applied = False
+    if apply:
+        import runtime
+        runtime.append("meta_assessment", agent="memory",
+                       confidence=confidence, metrics=metrics, nudges=nudges)
+        applied = True
+
+    if not quiet:
+        if confidence is None:
+            print("  no signal yet — meta-cognition self-assesses to null (nothing to record)")
+        else:
+            print(f"  confidence {confidence}  " + " ".join(
+                f"{k}={v}" for k, v in metrics.items() if v is not None))
+            print(f"    nudges: {', '.join(nudges) if nudges else 'none (reasoning healthy)'}")
+            if applied:
+                print("    recorded meta_assessment (agent='memory')")
+            else:
+                print("    dry-run: re-run with --apply to record the meta_assessment")
+    return {"confidence": confidence, "metrics": metrics, "nudges": nudges,
+            "applied": applied}
+
+
 def consolidate(apply: bool = False, quiet: bool = False) -> dict:
     """T2 consolidation pipeline (§9, §10): the offline "sleep cycle" run in order —
     abstraction → procedure learning → stale-belief pruning → snapshot/compaction.
@@ -735,22 +868,22 @@ def consolidate(apply: bool = False, quiet: bool = False) -> dict:
     import cognition
     if not quiet:
         print("T2 consolidation pipeline" + (" (--apply)" if apply else " (dry-run)") + ":")
-        print(" [1/6] abstraction")
+        print(" [1/8] abstraction")
     a = abstract(apply=apply, quiet=quiet)
     if not quiet:
-        print(" [2/6] procedure learning")
+        print(" [2/8] procedure learning")
     l = learn(apply=apply, quiet=quiet)
     if not quiet:
-        print(" [3/6] pattern mining")
+        print(" [3/8] pattern mining")
     m = mine(apply=apply, quiet=quiet)
     if not quiet:
-        print(" [4/7] stale-belief pruning")
+        print(" [4/8] stale-belief pruning")
     p = prune(apply=apply, quiet=quiet)
     if not quiet:
-        print(" [5/7] procedure retirement")
+        print(" [5/8] procedure retirement")
     rp = retire_procedures(apply=apply, quiet=quiet)
     if not quiet:
-        print(" [6/7] snapshot / compaction")
+        print(" [6/8] snapshot / compaction")
     s = cognition.snapshot(apply=apply)
     if not quiet:
         if apply:
@@ -761,15 +894,20 @@ def consolidate(apply: bool = False, quiet: bool = False) -> dict:
     # runs on apply as the offline pass that lets dormant ideas resurface next session.
     inc = None
     if not quiet:
-        print(" [7/7] incubation")
+        print(" [7/8] incubation")
     if apply:
         inc = cognition.incubate()
         if not quiet:
             print(f"   incubated {inc['incubated']} dormant node(s)")
     elif not quiet:
         print("   dry-run: incubation would refresh the subconscious channel")
+    # v4.1 Phase 10: meta-cognition runs LAST so it self-assesses the state this cycle leaves
+    # behind. It reads only already-derived signals and never feeds itself (no recursion).
+    if not quiet:
+        print(" [8/8] meta-cognition")
+    mc = introspect(apply=apply, quiet=quiet)
     return {"abstract": a, "learn": l, "mine": m, "prune": p,
-            "retire_procedures": rp, "snapshot": s, "incubate": inc}
+            "retire_procedures": rp, "snapshot": s, "incubate": inc, "introspect": mc}
 
 
 # ─── compression: thread digests (§9; replaces session snapshots) ────────────
@@ -886,6 +1024,8 @@ def main(argv):
         prune(apply="--apply" in rest, quiet="--quiet" in rest); return 0
     if cmd == "retire-procedures":
         retire_procedures(apply="--apply" in rest, quiet="--quiet" in rest); return 0
+    if cmd == "introspect":
+        introspect(apply="--apply" in rest, quiet="--quiet" in rest); return 0
     if cmd == "consolidate":
         consolidate(apply="--apply" in rest, quiet="--quiet" in rest); return 0
     if cmd == "digest":
