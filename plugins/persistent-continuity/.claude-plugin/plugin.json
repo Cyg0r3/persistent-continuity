@@ -1,7 +1,7 @@
 {
   "name": "persistent-continuity",
   "description": "Cognition-native persistent memory for Claude Code. An append-only event log is the only source of truth; a self-maintaining cognitive graph focused by spreading-activation attention reconstructs your working state across sessions, context limits, and compaction. Pure Python stdlib, local-first, no API keys.",
-  "version": "3.1.1",
+  "version": "3.2.0",
   "author": {
     "name": "Michael Niemiec"
   },

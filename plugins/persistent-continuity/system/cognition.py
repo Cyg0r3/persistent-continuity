@@ -629,63 +629,153 @@ def active_subgraph(query: str = "", top_n: int = 8, agent: str = "", threads=No
             "contradictions": state["contradictions"], "core": core}
 
 
+# ─── Phase 1: working memory as a runtime object (ARCHITECTURE_V4.md §4.2) ───
+
+# Char budget for the rendered lens (~1,500-token guardrail). Mirrors runtime's
+# WORKING_CONTEXT_BUDGET_CHARS; markdown is export only, so this bounds the export.
+WORKING_MEMORY_BUDGET_CHARS = 6000
+
+
+class WorkingMemory:
+    """In-process attention lens over the active subgraph (L4).
+
+    V3 synthesized this lens fresh every prompt and treated working_context.md as the
+    artifact. V4 Phase 1 promotes it to a first-class runtime object: it is built once
+    from the graph, then `mutate()`d incrementally as new events land (no full
+    re-synthesis), `reprioritize()`d within a fixed budget, and `render()`ed to markdown
+    only for export/debug. `concepts`/`procedures` are reserved for Phases 2/3 and stay
+    empty here (absent ⇒ current behavior, per the backward-compat invariant)."""
+
+    def __init__(self, budget: int = WORKING_MEMORY_BUDGET_CHARS,
+                 query: str = "", agent: str = ""):
+        self.active: dict = {}        # event_id -> activation (current focus)
+        self.threads: dict = {}       # thread_id -> activation
+        self.concepts: list = []      # semantic context in scope  (Phase 2)
+        self.procedures: list = []    # applicable how-to knowledge (Phase 3)
+        self.budget = budget
+        self.query = query
+        self.agent = agent
+        # detail backing render(), keyed for O(1) incremental mutation
+        self._nodes: dict = {}        # event_id -> node detail row
+        self._th_meta: dict = {}      # thread_id -> threads-table row
+        self._resurfaced: set = set()
+        self._contradictions: list = []
+
+    @classmethod
+    def from_graph(cls, query: str = "", top_n: int = 8, agent: str = "",
+                   threads=None, budget: int = WORKING_MEMORY_BUDGET_CHARS):
+        """Synthesize working memory from the current active subgraph (initial seed)."""
+        sg = active_subgraph(query, top_n, agent=agent, threads=threads)
+        wm = cls(budget=budget, query=query, agent=agent)
+        conn = sqlite3.connect(COG_DB)
+        conn.row_factory = sqlite3.Row
+        wm._th_meta = {r["thread_id"]: dict(r) for r in conn.execute("SELECT * FROM threads")}
+        conn.close()
+        for n in sg["nodes"]:
+            wm._nodes[n["event_id"]] = n
+            wm.active[n["event_id"]] = n["activation"]
+        wm.threads = dict(sg["threads"])
+        wm._resurfaced = set(sg["resurfaced"])
+        wm._contradictions = list(sg["contradictions"])
+        return wm
+
+    def mutate(self, event: dict) -> "WorkingMemory":
+        """Fold one freshly-appended event into the lens WITHOUT rebuilding the graph.
+
+        The new event is the most-recent signal, so it enters focus at the current peak
+        activation (never below the existing top), and its threads are bumped likewise.
+        Truth still lives in the log; this only keeps the in-process lens warm between
+        builds. A subsequent build()+from_graph() reconciles to the exact projection."""
+        eid = event.get("event_id")
+        if not eid:
+            return self
+        peak = max(self.active.values(), default=0.0)
+        act = max(peak, 1.0)
+        self._nodes[eid] = {
+            "event_id": eid, "type": event.get("type", ""),
+            "layer": _layer(event), "body": _body(event),
+            "t": event.get("t", now_iso()), "activation": act,
+        }
+        self.active[eid] = act
+        for tid in _as_list(event.get("thread_ids")):
+            self.threads[tid] = max(self.threads.get(tid, 0.0), act)
+        return self
+
+    def reprioritize(self) -> "WorkingMemory":
+        """Re-rank focus by activation and drop the coldest nodes once render would
+        exceed budget. Attention-driven, budget-bounded — the lens stays small."""
+        ranked = sorted(self._nodes.values(), key=lambda n: n["activation"], reverse=True)
+        # Greedy keep highest-activation nodes until the rendered size hits budget.
+        while ranked and len(self._render(ranked)) > self.budget:
+            dropped = ranked.pop()
+            self.active.pop(dropped["event_id"], None)
+            self._nodes.pop(dropped["event_id"], None)
+        return self
+
+    def _ranked_nodes(self) -> list:
+        return sorted(self._nodes.values(), key=lambda n: n["activation"], reverse=True)
+
+    def _render(self, nodes: list) -> str:
+        threads_ranked = sorted(self.threads.items(), key=lambda kv: kv[1], reverse=True)
+        cognitive = [n for n in nodes if n["layer"] == "cognitive"]
+        loops = [n for n in cognitive if n["type"] == "open_loop"]
+        L = []
+        L.append(f"# Workspace @ {now_iso()} "
+                 f"(active subgraph: {len(nodes)} nodes / "
+                 f"{sum(1 for _, s in threads_ranked if s > 0)} threads)")
+        L.append("")
+        L.append("## Active threads")
+        shown = [(t, s) for t, s in threads_ranked if s > 0][:5]
+        if shown:
+            for i, (tid, sc) in enumerate(shown, 1):
+                meta = self._th_meta.get(tid)
+                title = (meta["title"] if meta else tid) or tid
+                flag = " ^resurfaced" if tid in self._resurfaced else ""
+                state = f" [{meta['status']}]" if meta else ""
+                L.append(f"{i}. [{sc:.2f}] {tid} - {title}{state}{flag}")
+        else:
+            L.append("(no threads yet - events are unthreaded)")
+        L.append("")
+        L.append("## Focus (highest activation)")
+        for n in cognitive[:5]:
+            L.append(f"- {n['type']} {n['event_id']}: {n['body'][:110]} [{n['activation']:.2f}]")
+        if not cognitive:
+            L.append("(no cognitive nodes active)")
+        L.append("")
+        if self._contradictions:
+            L.append("## Live tension (competing hypotheses)")
+            for a, b, sa, sb in self._contradictions:
+                lean = a if sa >= sb else b
+                L.append(f"- {a} vs {b} - leaning {lean} ({sa:.2f} vs {sb:.2f})")
+            L.append("")
+        L.append("## Next concrete action")
+        L.append(loops[0]["body"][:140] if loops else "(no open loops - define next objective)")
+        L.append("")
+        L.append("_Projection of the active subgraph; truth = runtime/events.jsonl_")
+        return "\n".join(L) + "\n"
+
+    def render(self) -> str:
+        """Export/debug → working_context.md text."""
+        return self._render(self._ranked_nodes())
+
+
 def workspace(query: str = "", top_n: int = 8, reinforce: bool = False,
               agent: str = "", threads=None) -> str:
     """Synthesize the ephemeral attention lens over the active subgraph (L4).
     This REPLACES stored working_context; writing it to disk is debug/export only.
 
+    V4 Phase 1: this is now a thin wrapper — `WorkingMemory.from_graph(...).render()`.
     reinforce=True emits an `attended` event for the top focus nodes (§5.3) so that
     what the workspace surfaces gains a replayable reinforcement floor next build.
     `agent`/`threads` select a role-biased window (§9); the reinforcement is tagged
     with the agent for provenance but its base-activation floor stays global (truth
     about the shared graph, not private to one window)."""
-    sg = active_subgraph(query, top_n, agent=agent, threads=threads)
-    conn = sqlite3.connect(COG_DB)
-    conn.row_factory = sqlite3.Row
-    th_meta = {r["thread_id"]: r for r in conn.execute("SELECT * FROM threads")}
-    conn.close()
-
-    threads_ranked = sorted(sg["threads"].items(), key=lambda kv: kv[1], reverse=True)
-    cognitive = [n for n in sg["nodes"] if n["layer"] == "cognitive"]
-    loops = [n for n in cognitive if n["type"] == "open_loop"]
-
-    if reinforce and cognitive:
-        _reinforce_attended([n["event_id"] for n in cognitive[:REINFORCE_TOP_N]], agent)
-
-    L = []
-    L.append(f"# Workspace @ {now_iso()} "
-             f"(active subgraph: {len(sg['nodes'])} nodes / "
-             f"{sum(1 for _, s in threads_ranked if s > 0)} threads)")
-    L.append("")
-    L.append("## Active threads")
-    shown = [(t, s) for t, s in threads_ranked if s > 0][:5]
-    if shown:
-        for i, (tid, sc) in enumerate(shown, 1):
-            meta = th_meta.get(tid)
-            title = (meta["title"] if meta else tid) or tid
-            flag = " ^resurfaced" if tid in sg["resurfaced"] else ""
-            state = f" [{meta['status']}]" if meta else ""
-            L.append(f"{i}. [{sc:.2f}] {tid} - {title}{state}{flag}")
-    else:
-        L.append("(no threads yet - events are unthreaded)")
-    L.append("")
-    L.append("## Focus (highest activation)")
-    for n in cognitive[:5]:
-        L.append(f"- {n['type']} {n['event_id']}: {n['body'][:110]} [{n['activation']:.2f}]")
-    if not cognitive:
-        L.append("(no cognitive nodes active)")
-    L.append("")
-    if sg["contradictions"]:
-        L.append("## Live tension (competing hypotheses)")
-        for a, b, sa, sb in sg["contradictions"]:
-            lean = a if sa >= sb else b
-            L.append(f"- {a} vs {b} - leaning {lean} ({sa:.2f} vs {sb:.2f})")
-        L.append("")
-    L.append("## Next concrete action")
-    L.append(loops[0]["body"][:140] if loops else "(no open loops - define next objective)")
-    L.append("")
-    L.append("_Projection of the active subgraph; truth = runtime/events.jsonl_")
-    return "\n".join(L) + "\n"
+    wm = WorkingMemory.from_graph(query, top_n, agent=agent, threads=threads)
+    if reinforce:
+        cognitive = [n for n in wm._ranked_nodes() if n["layer"] == "cognitive"]
+        if cognitive:
+            _reinforce_attended([n["event_id"] for n in cognitive[:REINFORCE_TOP_N]], agent)
+    return wm.render()
 
 
 def _reinforce_attended(event_ids: list, agent: str = "") -> None:
