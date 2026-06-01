@@ -19,7 +19,10 @@ intent seed => same subgraph.
 Subcommands:
     python cognition.py build [--force]       Build the graph (cognition.db) from events
                                               (skips when up-to-date; --force always rebuilds)
-    python cognition.py attend [query] [-n N]  Compute attention; show top active nodes/threads
+    python cognition.py attend [query] [-n N] [--oscillate]  Compute attention; show top
+                                              active nodes/threads (--oscillate: rotate focus)
+    python cognition.py incubate              Subconscious pass: lift dormant well-connected
+                                              nodes into the channel that seeds the next pass
     python cognition.py context [query] [--write]  Synthesize the dynamic workspace lens
     python cognition.py threads                List threads with state (active/dormant/merged)
     python cognition.py subgraph [query] [-n N]    Show the extracted active subgraph
@@ -80,10 +83,29 @@ REINFORCE_TOP_N = 3    # how many focus nodes get an `attended` event on reinfor
 EDGE_WEIGHT = {"causal": 1.0, "membership": 0.7, "thread_rel": 0.4,
                "concept": 0.6,        # v4 Phase 2: concept <-> evidence episode (semantic recall)
                "procedure": 0.6,      # v4 Phase 3: procedure <-> evidence episode (how-to recall)
+               "resonance": 0.5,      # v4 Phase 6: concept <-> concept association (Hebbian)
                "contradiction": 0.0}  # contradiction handled by inhibition, not spread
 CONCEPT_SEED = 0.55       # v4 Phase 2: in-scope concepts seed attention (scaled by salience)
 PROCEDURE_SEED = 0.6      # v4 Phase 3: a procedure seeds attention only when its trigger
                           # matches the current situation (scaled by outcome_score)
+
+# ── v4 Phase 6 attention dynamics (ARCHITECTURE_V4.md §8) ────────────────────
+# (1) Resonance: concepts whose evidence co-occurs across >= MIN_COOC threads "wire
+# together"; weight grows with co-occurrence (saturating at NORM) and is capped at
+# MAX_PER edges per concept so the graph never saturates.
+RESONANCE_MIN_COOC = 2
+RESONANCE_NORM = 4.0
+RESONANCE_MAX_PER = 6
+# (2) Incubation: a query-less low-gain diffusion that lifts dormant-but-well-connected
+# nodes into a separate channel, folded back as a small seed next pass (resurfacing).
+INCUBATE_GAMMA = 0.25
+INCUBATE_ROUNDS = 2
+INCUBATE_SEED = 0.30
+INCUBATION_WEIGHT = 0.5   # how strongly the incubation channel seeds the next attention pass
+# (3) Oscillation: anti-fixation focus rotation (OFF by default) — dampen the current
+# winner cluster, lift the runner-up, surfacing neglected-but-relevant threads.
+OSC_INHIBIT = 0.25
+OSC_LIFT = 0.20
 
 # ── multi-agent attention windows (ARCHITECTURE_V3.md §9) ────────────────────
 # Each agent computes its OWN attention over the ONE shared graph: same engine,
@@ -225,6 +247,9 @@ CREATE TABLE procedure_evidence (procedure_id TEXT, event_id TEXT);
 -- produced the vectors; `vec` is JSON (dense float list, or sparse {token: weight} for
 -- the stdlib TF-IDF default). Empty/absent ⇒ retrieval falls back to BM25 then lexical.
 CREATE TABLE vectors (event_id TEXT PRIMARY KEY, model TEXT, dim INTEGER, vec TEXT);
+-- v4 Phase 6 attention dynamics: a separate "subconscious" activation channel written by
+-- the query-less incubation pass; folded back into the next attention seed (resurfacing).
+CREATE TABLE incubation (event_id TEXT PRIMARY KEY, lift REAL);
 CREATE INDEX ix_mem_thread ON membership(thread_id);
 CREATE INDEX ix_edges_dst ON edges(dst);
 CREATE INDEX ix_edges_src ON edges(src);
@@ -238,8 +263,9 @@ CREATE INDEX ix_pev_procedure ON procedure_evidence(procedure_id);
 # procedures/procedure_evidence tables and the `procedure` edge; Phase 4 added the
 # `vectors` table (persisted embeddings for hybrid retrieval); Phase 5 added the
 # `nodes.cold` compaction flag, snapshot bookkeeping (meta.snapshot_seq), concept
-# retirement (`concept_retired`) and recency-recalibrated concept salience.
-SCHEMA_VERSION = 5
+# retirement (`concept_retired`) and recency-recalibrated concept salience; Phase 6 added
+# `resonance` concept<->concept edges and the `incubation` activation channel.
+SCHEMA_VERSION = 6
 
 
 def _build_watermark(db_path: Path) -> int:
@@ -387,6 +413,8 @@ def build(db_path: Path = COG_DB, force: bool = False) -> dict:
     _build_concepts(conn, events)
     # v4 Phase 3: materialize procedural memory from procedure_learned events.
     _build_procedures(conn, events)
+    # v4 Phase 6: Hebbian concept<->concept resonance edges (associative spreading).
+    _build_resonance(conn)
     # v4 Phase 4: persist one embedding per node so retrieval is a stored-vector scan.
     _build_vectors(conn)
     # v4 Phase 5: compact cold episodes behind the latest snapshot (keeps the active
@@ -546,6 +574,121 @@ def _build_procedures(conn, events: list) -> None:
                          (pid, eid, "procedure", EDGE_WEIGHT["procedure"]))
 
 
+def _build_resonance(conn) -> int:
+    """Hebbian concept<->concept resonance edges (v4 Phase 6 §8.1): concepts that "fire
+    together" — their evidence episodes co-occur in the same thread — "wire together", so
+    activation spreads associatively between related meanings, beyond causal/thread/concept
+    proximity. Co-occurrence = number of shared threads; the edge weight saturates at
+    RESONANCE_NORM, fires only past RESONANCE_MIN_COOC, and is capped at RESONANCE_MAX_PER
+    edges per concept so the graph never saturates. A pure projection of the log (the
+    evidence/membership it reads is itself derived), so resonance is fully replayable."""
+    concept_threads: dict = {}   # concept_id -> set(thread_id) of its evidence episodes
+    for cid, tid in conn.execute(
+            "SELECT ce.concept_id, m.thread_id FROM concept_evidence ce "
+            "JOIN membership m ON m.event_id = ce.event_id"):
+        concept_threads.setdefault(cid, set()).add(tid)
+
+    cids = sorted(concept_threads)
+    cooc: dict = {}
+    for i in range(len(cids)):
+        for j in range(i + 1, len(cids)):
+            shared = len(concept_threads[cids[i]] & concept_threads[cids[j]])
+            if shared >= RESONANCE_MIN_COOC:
+                cooc[(cids[i], cids[j])] = shared
+
+    # bound the graph: keep only each concept's strongest RESONANCE_MAX_PER associations
+    by_concept: dict = {}
+    for (a, b), w in cooc.items():
+        by_concept.setdefault(a, []).append((w, b))
+        by_concept.setdefault(b, []).append((w, a))
+    keep: set = set()
+    for c, lst in by_concept.items():
+        for w, other in sorted(lst, reverse=True)[:RESONANCE_MAX_PER]:
+            keep.add(tuple(sorted((c, other))))
+
+    base = EDGE_WEIGHT["resonance"]
+    n = 0
+    for (a, b) in sorted(keep):
+        w = cooc.get((a, b), 0)
+        weight = round(base * min(1.0, w / RESONANCE_NORM), 4)   # saturating, bounded
+        conn.execute("INSERT INTO edges VALUES (?,?,?,?)", (a, b, "resonance", weight))
+        n += 1
+    return n
+
+
+def incubate(persist: bool = True) -> dict:
+    """Subconscious incubation (v4 Phase 6 §8.2): a query-LESS, low-gain diffusion that lets
+    dormant-but-well-connected nodes accrue a small lift, so an unsolved problem can
+    "resurface with an idea" next session. Seeds from dormant-thread members weighted by
+    connectivity, diffuses a couple of low-gain rounds, and writes the result to the
+    separate `incubation` channel that `_seed` folds into the next attention pass. Pure
+    function of the current graph (a recomputable cache); empty channel ⇒ no effect."""
+    build()  # ensure the graph reflects the current log
+    conn = sqlite3.connect(COG_DB)
+    conn.row_factory = sqlite3.Row
+    nodes = [r["event_id"] for r in conn.execute("SELECT event_id FROM nodes")]
+
+    out_adj: dict = {}
+    degree: dict = {}
+    for r in conn.execute("SELECT src,dst,kind,weight FROM edges WHERE kind!='contradiction'"):
+        out_adj.setdefault(r["src"], []).append((r["dst"], r["weight"]))
+        out_adj.setdefault(r["dst"], []).append((r["src"], r["weight"]))
+        degree[r["src"]] = degree.get(r["src"], 0) + 1
+        degree[r["dst"]] = degree.get(r["dst"], 0) + 1
+
+    dormant = {r["thread_id"] for r in conn.execute(
+        "SELECT thread_id FROM threads WHERE status='dormant'")}
+    seed: dict = {}
+    if dormant:
+        q = ",".join("?" * len(dormant))
+        for r in conn.execute(
+                f"SELECT event_id FROM membership WHERE thread_id IN ({q})", list(dormant)):
+            eid = r["event_id"]
+            # well-connected dormant nodes incubate more strongly (diminishing returns)
+            seed[eid] = INCUBATE_SEED * (1.0 - math.exp(-degree.get(eid, 0) / 5.0))
+
+    act = dict(seed)
+    for _ in range(INCUBATE_ROUNDS):
+        nxt: dict = {}
+        for v in nodes:
+            spread = sum(w * act.get(u, 0.0) for (u, w) in out_adj.get(v, []))
+            val = INCUBATE_GAMMA * spread + seed.get(v, 0.0)
+            if val > 0:
+                nxt[v] = val
+        act = nxt
+    lift = {eid: round(a, 4) for eid, a in act.items() if a > 0.01}
+
+    if persist:
+        conn.execute("DELETE FROM incubation")
+        conn.executemany("INSERT INTO incubation(event_id,lift) VALUES (?,?)",
+                         list(lift.items()))
+        conn.commit()
+    conn.close()
+    return {"incubated": len(lift), "persisted": persist}
+
+
+def _apply_oscillation(conn, act: dict) -> None:
+    """Anti-fixation focus rotation (v4 Phase 6 §8.3, OFF by default): dampen the current
+    winner thread-cluster and lift the runner-up, so a neglected-but-relevant thread gets a
+    turn. In-place on the settled activation map; parameterized, never auto-on."""
+    members_by_thread: dict = {}
+    for r in conn.execute("SELECT thread_id, event_id FROM membership"):
+        members_by_thread.setdefault(r["thread_id"], []).append(r["event_id"])
+    tmax = {tid: max((act.get(m, 0.0) for m in mems), default=0.0)
+            for tid, mems in members_by_thread.items()}
+    ranked = sorted((t for t in tmax if tmax[t] > 0), key=tmax.get, reverse=True)
+    if len(ranked) < 2:
+        return
+    winner, runner = ranked[0], ranked[1]
+    lift = OSC_LIFT * tmax[winner]
+    for m in members_by_thread[winner]:
+        if m in act:
+            act[m] *= (1 - OSC_INHIBIT)
+    for m in members_by_thread[runner]:
+        if m in act:
+            act[m] += lift
+
+
 def _new_thread(tid: str) -> dict:
     return {"title": tid, "opened_t": None, "last_activity_t": None,
             "status": "active", "merged_into": None, "n_events": 0}
@@ -650,6 +793,13 @@ def _seed(conn, query: str, agent: str = "", threads=None) -> dict:
             seed = {eid: v for eid, v in seed.items() if eid not in cold}
     except sqlite3.Error:
         pass  # pre-Phase-5 cache without the cold column; next build() adds it
+    # v4 Phase 6: fold the incubation channel in AFTER cold-filtering, so a dormant
+    # (even compacted) but well-connected node can still "resurface with an idea".
+    try:
+        for r in conn.execute("SELECT event_id, lift FROM incubation"):
+            seed[r[0]] = max(seed.get(r[0], 0.0), INCUBATION_WEIGHT * (r[1] or 0.0))
+    except sqlite3.Error:
+        pass  # pre-Phase-6 cache without the incubation table; next build() adds it
     return seed
 
 
@@ -954,13 +1104,17 @@ def snapshot(apply: bool = False) -> dict:
             "procedures": len(blob["procedures"]), "written": written, "applied": apply}
 
 
-def attend(query: str = "", persist: bool = True, agent: str = "", threads=None) -> dict:
+def attend(query: str = "", persist: bool = True, agent: str = "", threads=None,
+           oscillate: bool = False) -> dict:
     """Compute the attention state via spreading activation over the graph.
 
     `agent` (+ optional `threads` assignment) selects a role-biased attention window
     over the ONE shared graph (§9): the seed is constrained, the spread is not.
     Attention persistence is scoped per agent so concurrent windows never bleed.
     `agent=''` is the single-agent path (unchanged).
+
+    `oscillate` (v4 Phase 6 §8.3, OFF by default) rotates focus off the current winner
+    cluster onto the runner-up to break fixation; default False reproduces V3.1 behavior.
 
     Returns {"nodes": {eid: activation}, "threads": {tid: activation},
              "resurfaced": [tid], "contradictions": [(a,b,score_a,score_b)]}."""
@@ -1022,6 +1176,10 @@ def attend(query: str = "", persist: bool = True, agent: str = "", threads=None)
             for eid in act:
                 act[eid] = ALPHA * act[eid] + (1 - ALPHA) * prev.get(eid, 0.0)
 
+    # v4 Phase 6 anti-fixation oscillation (opt-in): rotate focus to the runner-up cluster.
+    if oscillate:
+        _apply_oscillation(conn, act)
+
     # thread activation = max member activation; dormant resurfacing
     thread_act, resurfaced = {}, []
     for tr in conn.execute("SELECT * FROM threads"):
@@ -1057,12 +1215,13 @@ def attend(query: str = "", persist: bool = True, agent: str = "", threads=None)
 
 # ─── active subgraph extraction + workspace synthesis (§6, §7) ───────────────
 
-def active_subgraph(query: str = "", top_n: int = 8, agent: str = "", threads=None) -> dict:
+def active_subgraph(query: str = "", top_n: int = 8, agent: str = "", threads=None,
+                    oscillate: bool = False) -> dict:
     """Top-activation nodes expanded <=HOP_LIMIT hops = the active subgraph.
 
     `agent`/`threads` select a role-biased window (§9); defaults reproduce the
-    single-agent subgraph exactly."""
-    state = attend(query, agent=agent, threads=threads)
+    single-agent subgraph exactly. `oscillate` (Phase 6) rotates focus off the winner."""
+    state = attend(query, agent=agent, threads=threads, oscillate=oscillate)
     conn = sqlite3.connect(COG_DB)
     conn.row_factory = sqlite3.Row
     ranked = sorted(state["nodes"].items(), key=lambda kv: kv[1], reverse=True)
@@ -1418,9 +1577,15 @@ def main(argv):
         print("\nusage: attend|context|subgraph --agent <role> [--threads t1,t2]")
         return 0
 
+    if cmd == "incubate":
+        info = incubate()
+        print(f"Incubation pass: lifted {info['incubated']} dormant node(s) into the "
+              f"subconscious channel (folded into the next attention seed).")
+        return 0
+
     if cmd == "attend":
         query, n, agent, threads = _q_and_n(10)
-        st = attend(query, agent=agent, threads=threads)
+        st = attend(query, agent=agent, threads=threads, oscillate="--oscillate" in rest)
         ranked = sorted(st["nodes"].items(), key=lambda kv: kv[1], reverse=True)[:n]
         conn = sqlite3.connect(COG_DB); conn.row_factory = sqlite3.Row
         bodies = {r["event_id"]: r["body"] for r in conn.execute(
@@ -1448,7 +1613,8 @@ def main(argv):
 
     if cmd == "subgraph":
         query, n, agent, threads = _q_and_n(8)
-        sg = active_subgraph(query, n, agent=agent, threads=threads)
+        sg = active_subgraph(query, n, agent=agent, threads=threads,
+                             oscillate="--oscillate" in rest)
         for node in sg["nodes"]:
             print(f"  [{node['activation']:.3f}] ({node['layer']}/{node['type']}) "
                   f"{node['event_id']}  {node['body'][:80]}")

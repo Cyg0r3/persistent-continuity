@@ -474,8 +474,24 @@ cognition**, then **scale-out**.
 > Covered by `tests/test_phase5_consolidation.py` (11 tests). *Outcome: unlimited-timescale scaling —
 > the active graph stays small while the log grows.*
 
-> **Phase 6 — Attention dynamics.**
-> Resonance edges, incubation channel, oscillation. *Outcome: associative + anti-fixation cognition.*
+> **Phase 6 — Attention dynamics. ✅ BUILT.**
+> Layered the four §8 dynamics onto the V3 spreading-activation engine with no rewrite (gated by
+> `meta.schema_version=6` so pre-Phase-6 caches rebuild instead of skipping): (1) **Resonance** —
+> `cognition._build_resonance` adds Hebbian concept↔concept `resonance` edges (added to `EDGE_WEIGHT`)
+> when two concepts' evidence co-occurs across ≥ `RESONANCE_MIN_COOC` threads ("fire together → wire
+> together"); the weight saturates at `RESONANCE_NORM` and is capped at `RESONANCE_MAX_PER` per concept
+> so the graph never saturates, and the edges spread like any other — activating one concept
+> associatively lifts its resonant peers beyond causal/thread proximity. It is a deterministic
+> projection of the log (fully replayable). (2) **Incubation** — `cognition.incubate` runs a query-less,
+> low-gain diffusion that lifts dormant-but-well-connected nodes into a separate `incubation` channel,
+> which `_seed` folds in *after* cold-filtering, so a neglected idea can "resurface with an idea" next
+> session (even one a snapshot compacted). (3) **Oscillation** — `attend(..., oscillate=True)`
+> (`--oscillate`, OFF by default) dampens the current winner thread-cluster and lifts the runner-up to
+> break fixation; default-off reproduces V3.1 ranking exactly. (4) **Cross-session persistence** —
+> the existing per-agent `activation` table plus the incubation seed carry the last working set into
+> resume seeding (§4.1 step 3). Incubation is wired into `reflect.py consolidate` as the offline pass.
+> Covered by `tests/test_phase6_attention.py` (10 tests). *Outcome: associative + anti-fixation
+> cognition.*
 
 > **Phase 7 — Branching/versioning + multi-agent formalization.**
 > Optional `branch` field + `branch_open/merge`; agent-local `WorkingMemory`; curator arbitration.

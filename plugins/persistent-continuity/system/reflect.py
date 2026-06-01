@@ -528,14 +528,25 @@ def consolidate(apply: bool = False, quiet: bool = False) -> dict:
         print(" [3/4] stale-belief pruning")
     p = prune(apply=apply, quiet=quiet)
     if not quiet:
-        print(" [4/4] snapshot / compaction")
+        print(" [4/5] snapshot / compaction")
     s = cognition.snapshot(apply=apply)
     if not quiet:
         if apply:
             print(f"   snapshot at seq {s['snapshot_seq']} -> {s['written']}")
         else:
             print(f"   dry-run: snapshot would cover {s['snapshot_seq']} events")
-    return {"abstract": a, "learn": l, "prune": p, "snapshot": s}
+    # v4 Phase 6: subconscious incubation refreshes a cache (no truth side effect), so it
+    # runs on apply as the offline pass that lets dormant ideas resurface next session.
+    inc = None
+    if not quiet:
+        print(" [5/5] incubation")
+    if apply:
+        inc = cognition.incubate()
+        if not quiet:
+            print(f"   incubated {inc['incubated']} dormant node(s)")
+    elif not quiet:
+        print("   dry-run: incubation would refresh the subconscious channel")
+    return {"abstract": a, "learn": l, "prune": p, "snapshot": s, "incubate": inc}
 
 
 # ─── compression: thread digests (§9; replaces session snapshots) ────────────
