@@ -31,6 +31,12 @@ Subcommands:
                                                checkpoint + re-inject fresh workspace
     python cognition.py snapshot [--apply]     T2 consolidation checkpoint: record a snapshot
                                                so cold episodes compact (dry-run unless --apply)
+    python cognition.py build --branch <name>  Reconstruct a labeled branch into the cache
+    python cognition.py branches               List branches (main/merged/open) + event counts
+    python cognition.py reconstruct <branch>   Replay a hypothetical branch in isolation
+                                               (mainline cache untouched) and diff vs main
+    python cognition.py audit                  Curator-arbitration audit: flag consolidation
+                                               events emitted by a non-curator agent
 
 Multi-agent (§9): attend/context/subgraph accept --agent <planner|coder|researcher|memory>
 and --threads <t1,t2> to compute a role-biased attention WINDOW over the one shared graph
@@ -121,6 +127,20 @@ ROLE_PROFILES = {
     "researcher": {"observation", "hypothesis", "contradiction", "assumption"},
     "memory":     {"contradiction", "assumption", "assumption_invalidated",
                    "open_loop", "reflection"},
+}
+
+# ── v4 Phase 7 branching/versioning + multi-agent formalization (§3.3, §10) ────
+# A branch is a labeled SUBSET of the one log, not a fork of the file. Events carry an
+# optional `branch` (absent ⇒ "main", back-compatible); `branch_open`/`branch_merge`
+# bracket a hypothetical line of cognition. Reconstructing branch B replays main + any
+# merged branches + B, so the same log can render the real timeline OR a what-if without
+# ever forking events.jsonl. The default build reconstructs "main".
+DEFAULT_BRANCH = "main"
+# Multi-agent arbitration (§10): the memory curator is the single consolidation authority.
+CURATOR_AGENT = "memory"
+CURATOR_TYPES = {
+    "concept_formed", "procedure_learned", "concept_retired",
+    "assumption_invalidated", "loop_closed", "snapshot",
 }
 
 
@@ -264,8 +284,9 @@ CREATE INDEX ix_pev_procedure ON procedure_evidence(procedure_id);
 # `vectors` table (persisted embeddings for hybrid retrieval); Phase 5 added the
 # `nodes.cold` compaction flag, snapshot bookkeeping (meta.snapshot_seq), concept
 # retirement (`concept_retired`) and recency-recalibrated concept salience; Phase 6 added
-# `resonance` concept<->concept edges and the `incubation` activation channel.
-SCHEMA_VERSION = 6
+# `resonance` concept<->concept edges and the `incubation` activation channel; Phase 7
+# added branch-filtered projection (the default mainline build excludes unmerged branches).
+SCHEMA_VERSION = 7
 
 
 def _build_watermark(db_path: Path) -> int:
@@ -291,17 +312,87 @@ def _build_watermark(db_path: Path) -> int:
         return -1
 
 
-def build(db_path: Path = COG_DB, force: bool = False) -> dict:
+# ── v4 Phase 7: branch filtering (a branch is a labeled subset of the one log) ──
+def _branch_of(e: dict) -> str:
+    return e.get("branch") or DEFAULT_BRANCH
+
+
+def _merged_branches(events: list) -> set:
+    """Branches folded back into the mainline via a `branch_merge` event."""
+    merged = set()
+    for e in events:
+        if e.get("type") == "branch_merge":
+            nm = e.get("branch") or e.get("from")
+            if nm and nm != DEFAULT_BRANCH:
+                merged.add(nm)
+    return merged
+
+
+def _events_for_branch(events: list, branch: str = DEFAULT_BRANCH) -> list:
+    """Replay set for reconstructing `branch`: the mainline + every merged branch + the
+    requested branch itself. An unmerged what-if branch is excluded from `main`, so a
+    hypothetical never pollutes the real timeline — yet both come from the one log."""
+    include = {DEFAULT_BRANCH} | _merged_branches(events)
+    if branch:
+        include.add(branch)
+    return [e for e in events if _branch_of(e) in include]
+
+
+def branches(events: list = None) -> list:
+    """List every branch in the log with its status (main / merged / open) + event count."""
+    if events is None:
+        events = read_events()
+    merged = _merged_branches(events)
+    opened, counts = {}, {}
+    for e in events:
+        b = _branch_of(e)
+        counts[b] = counts.get(b, 0) + 1
+        if e.get("type") == "branch_open":
+            nm = e.get("branch") or e.get("name")
+            if nm:
+                opened[nm] = {"opened_t": e.get("t"),
+                              "base": e.get("from") or DEFAULT_BRANCH}
+    names = set(counts) | set(opened) | merged | {DEFAULT_BRANCH}
+    out = []
+    for nm in sorted(names):
+        status = ("main" if nm == DEFAULT_BRANCH
+                  else "merged" if nm in merged else "open")
+        out.append({"branch": nm, "status": status, "events": counts.get(nm, 0),
+                    "base": opened.get(nm, {}).get("base", DEFAULT_BRANCH)})
+    return out
+
+
+def arbitration_violations(events: list = None) -> list:
+    """Curator-arbitration audit (v4 Phase 7 / §10): consolidation-type events emitted by
+    a named non-curator agent. Append-only means these are never rejected at write time;
+    this surfaces them as an auditable list. Returns [{event_id, type, agent}]."""
+    if events is None:
+        events = read_events()
+    out = []
+    for seq, e in enumerate(events, 1):
+        et, ag = e.get("type", ""), e.get("agent")
+        if et in CURATOR_TYPES and ag and ag != CURATOR_AGENT:
+            out.append({"event_id": e.get("event_id") or f"evt_{seq}",
+                        "type": et, "agent": ag})
+    return out
+
+
+def build(db_path: Path = COG_DB, force: bool = False,
+          branch: str = DEFAULT_BRANCH) -> dict:
     """Rebuild the cognitive graph from zero (drop-and-rebuild = pure projection).
 
     v4 Phase 0 — watermark skip: the graph is a pure function of the event log, so if
     the log hasn't grown since the last build the existing cognition.db is already a
     correct projection and we skip the O(N) rebuild. `force=True` always rebuilds
     (full-rebuild fallback for integrity / schema changes). Correctness still rests on
-    the log; the watermark only avoids redundant work."""
+    the log; the watermark only avoids redundant work.
+
+    v4 Phase 7 — `branch` selects which labeled subset of the log to reconstruct
+    (default "main"; absent fields ⇒ main, so existing logs project byte-for-byte). The
+    watermark/skip fast-path only applies to the default mainline build."""
     events = read_events()
     RUNTIME.mkdir(parents=True, exist_ok=True)
-    if not force and _build_watermark(db_path) == len(events):
+    if not force and branch == DEFAULT_BRANCH and _build_watermark(db_path) == len(events):
         conn = sqlite3.connect(db_path)
         summary = {
             "events": len(events),
@@ -316,7 +407,44 @@ def build(db_path: Path = COG_DB, force: bool = False) -> dict:
         db_path.unlink()
     conn = sqlite3.connect(db_path)
     conn.executescript(SCHEMA)
+    summary = _project(conn, _events_for_branch(events, branch))
 
+    # watermark: record the FULL event count (so log growth is detected) + schema version.
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('event_count',?)",
+                 (str(len(events)),))
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",
+                 (str(SCHEMA_VERSION),))
+    if branch != DEFAULT_BRANCH:
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('branch',?)",
+                     (branch,))
+    conn.commit()
+    summary["events"] = len(events)
+    summary["skipped"] = False
+    conn.close()
+    _export_threads(summary)
+    return summary
+
+
+def reconstruct(branch: str, db_path: Path = None) -> dict:
+    """Reconstruct a hypothetical (or any) branch WITHOUT touching the mainline cache.
+
+    Builds the graph for `branch` into an isolated db (in-memory by default) and returns
+    its summary — so "what if we'd chosen Postgres?" can be replayed and measured against
+    main without forking the log or clobbering runtime/cognition.db."""
+    events = read_events()
+    conn = sqlite3.connect(str(db_path) if db_path else ":memory:")
+    conn.executescript(SCHEMA)
+    summary = _project(conn, _events_for_branch(events, branch))
+    summary["events"] = len(_events_for_branch(events, branch))
+    summary["branch"] = branch
+    conn.close()
+    return summary
+
+
+def _project(conn, events: list) -> dict:
+    """Project a (branch-filtered) event list into the graph cache; returns the summary
+    counts. Shared by build() (mainline, persisted) and reconstruct() (what-if, isolated)
+    so both paths are byte-for-byte the same projection."""
     closed = {e.get("id") for e in events if e.get("type") == "loop_closed"}
     # reinforcement: count `attended` events per target event_id (§5.3, replayable)
     reinforced: dict = {}
@@ -420,14 +548,8 @@ def build(db_path: Path = COG_DB, force: bool = False) -> dict:
     # v4 Phase 5: compact cold episodes behind the latest snapshot (keeps the active
     # graph small over unlimited time; the log stays whole, meaning persists as concepts).
     n_cold = _apply_compaction(conn, events)
-
-    # watermark: record the event count + schema version this build is a projection of.
-    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('event_count',?)",
-                 (str(len(events)),))
-    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",
-                 (str(SCHEMA_VERSION),))
     conn.commit()
-    summary = {
+    return {
         "events": len(events),
         "nodes": conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0],
         "threads": len(threads),
@@ -436,11 +558,7 @@ def build(db_path: Path = COG_DB, force: bool = False) -> dict:
         "procedures": conn.execute("SELECT COUNT(*) FROM procedures").fetchone()[0],
         "vectors": conn.execute("SELECT COUNT(*) FROM vectors").fetchone()[0],
         "cold": n_cold,
-        "skipped": False,
     }
-    conn.close()
-    _export_threads(summary)
-    return summary
 
 
 def _concept_id_of(e: dict) -> str:
@@ -1260,6 +1378,30 @@ def active_subgraph(query: str = "", top_n: int = 8, agent: str = "", threads=No
 WORKING_MEMORY_BUDGET_CHARS = 6000
 
 
+def _agent_threads(agent: str, limit: int = 4) -> list:
+    """The threads in an agent's own scoped attention channel — its lane (v4 §10).
+
+    Reads the per-agent `thread_activation` rows (V3.1 per-agent persistence) so an
+    agent's working memory is seeded by where ITS attention already is, falling back to
+    the globally-active threads for a cold agent. Returns None when nothing applies, so
+    WorkingMemory.from_graph keeps its existing (assignment-free) behaviour."""
+    if not COG_DB.exists():
+        return None
+    conn = sqlite3.connect(COG_DB)
+    try:
+        rows = conn.execute(
+            "SELECT thread_id FROM thread_activation WHERE agent=? AND thread_id IS NOT NULL "
+            "ORDER BY activation DESC LIMIT ?", (agent, limit)).fetchall()
+        if not rows:
+            rows = conn.execute(
+                "SELECT thread_id FROM threads WHERE status='active' LIMIT ?",
+                (limit,)).fetchall()
+    except sqlite3.Error:
+        rows = []
+    conn.close()
+    return [r[0] for r in rows] or None
+
+
 class WorkingMemory:
     """In-process attention lens over the active subgraph (L4).
 
@@ -1323,6 +1465,18 @@ class WorkingMemory:
         wm._resurfaced = set(sg["resurfaced"])
         wm._contradictions = list(sg["contradictions"])
         return wm
+
+    @classmethod
+    def for_agent(cls, agent: str, query: str = "", top_n: int = 8,
+                  budget: int = WORKING_MEMORY_BUDGET_CHARS) -> "WorkingMemory":
+        """Agent-local working memory (v4 Phase 7 / §10): a first-class per-agent lens
+        over the ONE shared graph, seeded by the agent's role focus (ROLE_PROFILES) and
+        the threads currently in its own attention lane (_agent_threads). Each agent keeps
+        a scoped focus without a separate store — coordination stays event-only, the graph
+        stays shared. `agent=''` reduces to the single-agent from_graph path."""
+        return cls.from_graph(query=query, top_n=top_n, agent=agent,
+                              threads=_agent_threads(agent) if agent else None,
+                              budget=budget)
 
     def mutate(self, event: dict) -> "WorkingMemory":
         """Fold one freshly-appended event into the lens WITHOUT rebuilding the graph.
@@ -1532,13 +1686,51 @@ def main(argv):
         return 0
 
     if cmd == "build":
-        s = build(force="--force" in rest)
+        br = DEFAULT_BRANCH
+        if "--branch" in rest:
+            i = rest.index("--branch")
+            br = rest[i + 1] if i + 1 < len(rest) else DEFAULT_BRANCH
+        s = build(force="--force" in rest, branch=br)
         verb = "up-to-date (skipped rebuild)" if s.get("skipped") else "built"
         vecs = f", {s['vectors']} vectors" if "vectors" in s else ""
         cold = f", {s['cold']} cold" if s.get("cold") else ""
-        print(f"Graph {verb} from {s['events']} events: {s['nodes']} nodes, "
+        tag = "" if br == DEFAULT_BRANCH else f" [branch={br}]"
+        print(f"Graph {verb} from {s['events']} events{tag}: {s['nodes']} nodes, "
               f"{s['threads']} threads, {s['edges']} edges{vecs}{cold} -> "
               f"{COG_DB.relative_to(ROOT)}")
+        return 0
+
+    if cmd == "branches":
+        for b in branches():
+            base = "" if b["base"] == DEFAULT_BRANCH else f" (from {b['base']})"
+            print(f"  [{b['status']:<7}] {b['branch']:<20} "
+                  f"events={b['events']}{base}")
+        return 0
+
+    if cmd == "reconstruct":
+        if not rest:
+            print("usage: reconstruct <branch>"); return 2
+        br = rest[0]
+        s = reconstruct(br)
+        main = reconstruct(DEFAULT_BRANCH)
+        print(f"Reconstructed branch '{br}' (isolated, mainline cache untouched):")
+        print(f"  {s['events']} events -> {s['nodes']} nodes, {s['threads']} threads, "
+              f"{s['edges']} edges, {s['concepts']} concepts")
+        d = s["nodes"] - main["nodes"]
+        print(f"  vs main: {d:+d} nodes "
+              f"({'hypothetical adds context' if d > 0 else 'same as main'})")
+        return 0
+
+    if cmd == "audit":
+        viol = arbitration_violations()
+        if not viol:
+            print(f"arbitration audit: clean — all curator-owned events under "
+                  f"agent='{CURATOR_AGENT}' (or system).")
+            return 0
+        print(f"arbitration audit: {len(viol)} curator-owned event(s) emitted by a "
+              f"non-curator agent (should PROPOSE, not consolidate):")
+        for v in viol:
+            print(f"  {v['event_id']:<14} {v['type']:<22} agent={v['agent']}")
         return 0
 
     if cmd == "snapshot":

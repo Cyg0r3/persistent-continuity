@@ -493,9 +493,32 @@ cognition**, then **scale-out**.
 > Covered by `tests/test_phase6_attention.py` (10 tests). *Outcome: associative + anti-fixation
 > cognition.*
 
-> **Phase 7 — Branching/versioning + multi-agent formalization.**
-> Optional `branch` field + `branch_open/merge`; agent-local `WorkingMemory`; curator arbitration.
-> *Outcome: hypothetical reconstruction and clean multi-agent evolution.*
+> **Phase 7 — Branching/versioning + multi-agent formalization. ✅ BUILT.**
+> Closed out V4 with the evolvability layer, all over the one append-only log (gated by
+> `meta.schema_version=7` so pre-Phase-7 caches rebuild instead of skipping). (1) **Branching/
+> versioning** — events carry an optional `branch` field (absent ⇒ `main`, so every existing log
+> projects byte-for-byte; `runtime.append` drops a redundant `branch="main"`), bracketed by the new
+> `branch_open`/`branch_merge` truth events. A branch is a **labeled subset of the one log, never a
+> fork of the file**: `cognition._events_for_branch` reconstructs a branch as *main + every merged
+> branch + that branch*, so the default `build()` excludes an **unmerged** what-if (a hypothetical
+> never pollutes the real timeline) while `branch_merge` folds it back in for the next build.
+> `cognition.reconstruct(branch)` replays any branch into an **isolated** db (in-memory by default)
+> and diffs it against main **without touching `runtime/cognition.db`** — "what if we'd chosen
+> Postgres?" becomes a measurable replay, not a forked repo. `build()` and `reconstruct()` share one
+> projection core (`_project`) so both are the same deterministic function of the log. CLI: `branches`,
+> `reconstruct <branch>`, `build --branch <name>`. (2) **Agent-local working memory** —
+> `WorkingMemory.for_agent(agent)` formalizes the §10 per-agent lens as a first-class object over the
+> ONE shared graph, seeded by the agent's role focus (`ROLE_PROFILES`) **and** the threads in its own
+> attention lane (`_agent_threads`, reading the V3.1 per-agent `thread_activation` channel); `agent=''`
+> reduces exactly to the single-agent `from_graph`. (3) **Curator arbitration** — the memory curator
+> (`CURATOR_AGENT="memory"`) is the single consolidation authority: the consolidation event types
+> (`concept_formed`, `procedure_learned`, `concept_retired`, `assumption_invalidated`, `loop_closed`,
+> `snapshot`) are CONCLUSIONS only it emits; other agents *propose*. Append-only means a violation is
+> never rejected (no lost writes) but made **auditable** — `runtime.append` flags a curator-owned event
+> written under a named non-curator agent, and `cognition audit` (`arbitration_violations`) lists them.
+> No locks: arbitration is a consolidation projection, coordination stays event-only. Covered by
+> `tests/test_phase7_branching.py` (13 tests). *Outcome: hypothetical reconstruction and clean
+> multi-agent evolution — all from the one log that remains the only truth.*
 
 Every phase maps to a measurable gain — Phases 0/5 to scalability, 2/3/4 to retrieval quality and
 reasoning coherence, 1/6 to continuity fidelity, 7 to evolvability — and none adds an always-on

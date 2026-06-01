@@ -65,7 +65,26 @@ KNOWN_TYPES = {
     "procedure_learned",
     # v4 Phase 5 consolidation: snapshot checkpoint + stale-concept retirement (curator-owned)
     "snapshot", "concept_retired",
+    # v4 Phase 7 branching/versioning: label a hypothetical line of cognition + fold it back
+    "branch_open", "branch_merge",
 }
+
+# v4 Phase 7 multi-agent arbitration (§10): the memory curator owns consolidation. These
+# event types are CONCLUSIONS the curator emits after arbitrating proposals; other agents
+# *propose* (hypothesis/contradiction/...) but do not consolidate. Emitting one under a
+# non-curator agent is flagged (append-only ⇒ never rejected, only made auditable).
+CURATOR_AGENT = "memory"
+CURATOR_TYPES = {
+    "concept_formed", "procedure_learned", "concept_retired",
+    "assumption_invalidated", "loop_closed", "snapshot",
+}
+
+
+def is_arbitration_violation(event_type: str, agent) -> bool:
+    """True iff a curator-owned consolidation type is being emitted by a *named*
+    non-curator agent (un-agented system/CLI writes are the curator path, so allowed)."""
+    return (event_type in CURATOR_TYPES
+            and bool(agent) and agent != CURATOR_AGENT)
 
 # v3: cognitive vs execution vs meta layer, inferred from type when not given (§4).
 COGNITIVE_TYPES = {
@@ -165,6 +184,10 @@ def append(event_type: str, **fields) -> dict:
             fields[k] = [s.strip() for s in v.split(",") if s.strip()]
         elif v in (None, ""):
             fields.pop(k, None)
+    # v4 Phase 7: `branch` is optional; the default branch is "main", so an absent or
+    # "main" value is dropped to keep events v2-clean (absent ⇒ main, back-compatible).
+    if fields.get("branch") in (None, "", "main"):
+        fields.pop("branch", None)
 
     event.update(fields)
     # validate it round-trips as a single JSON line before committing
@@ -175,6 +198,10 @@ def append(event_type: str, **fields) -> dict:
         fh.write(line + "\n")
     if event_type not in KNOWN_TYPES:
         print(f"  (note: '{event_type}' is an unknown type — stored, not modeled)")
+    if is_arbitration_violation(event_type, event.get("agent")):
+        print(f"  (note: '{event_type}' is curator-owned (agent='{CURATOR_AGENT}'); "
+              f"agent='{event.get('agent')}' should PROPOSE, not consolidate — stored, "
+              f"flagged for arbitration audit)", file=sys.stderr)
     return event
 
 
