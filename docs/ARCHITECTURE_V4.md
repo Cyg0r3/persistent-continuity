@@ -171,6 +171,9 @@ New **edge kinds** (the `edges` table is already `(src,dst,kind,weight)`):
 
 - **New truth event types** (added to `KNOWN_TYPES` in runtime.py): `concept_formed`,
   `procedure_learned`, `snapshot`, `branch_open`, `branch_merge`. All optional/back-compatible.
+  The V4.1 adaptive layer (§13–16) adds `pattern_detected`, `proc_executed`, `procedure_retired`,
+  `meta_assessment`, and `pattern_promoted` — same rule: optional, curator-owned where they are
+  conclusions, absent ⇒ current behavior.
 - **Branching/versioning.** An optional `branch` field on events + a `branch_open`/`branch_merge`
   pair lets the runtime reconstruct *hypothetical* cognition ("what if we'd chosen Postgres?") without
   forking the file: a branch is just a labeled subset of the one log, and the graph build can be asked
@@ -520,9 +523,49 @@ cognition**, then **scale-out**.
 > `tests/test_phase7_branching.py` (13 tests). *Outcome: hypothetical reconstruction and clean
 > multi-agent evolution — all from the one log that remains the only truth.*
 
+> **Phase 8 — Pattern recognition layer. ⏳ PLANNED.**
+> Promote *patterns* to first-class memory objects (§13). A T2 mining pass (`patterns.py mine`,
+> dry-run by default) reads the projected graph and the causal DAG and detects recurring reasoning
+> structures, repeated failure modes, successful execution paths, temporal correlations, loop
+> recurrence, and cross-thread/cross-project conceptual similarity, emitting `pattern_detected`
+> truth events (curator-owned). `cognition._build_patterns` projects them into a new `patterns`
+> table with `confidence`/`frequency`/`recommended_actions`; pattern nodes (`mem_class='pattern'`)
+> join the graph and spread like concepts so an active context *surfaces the pattern it is repeating*.
+> Pure stdlib: motif/sequence detection over the existing edge/membership tables; no new dependency.
+> Gated by a `meta.schema_version` bump. *Outcome: pattern-aware cognition — the system recognizes
+> what it is doing again.*
+
+> **Phase 9 — Adaptive procedural learning. ⏳ PLANNED.**
+> Turn the static `procedures` table (Phase 3) into self-improving procedural cognition (§14). A new
+> `proc_executed` event records each time a procedure is reused with its `outcome` (success/failure);
+> `cognition._build_procedures` folds these into a reinforcement-weighted `outcome_score` (effective
+> strategies strengthen, failed ones decay), tracks `uses`/`last_used_t`, and lets consolidation
+> *synthesize* and *generalize* procedures (abstracting a family of successful chains into one
+> heuristic) and retire chronically-failing ones (`procedure_retired`). Retrieval prefers
+> high-scoring, context-matched procedures. Append-only and replayable: the score is a deterministic
+> projection of the execution log. *Outcome: the workflows that consistently succeed get stronger;
+> the ones that fail fade.*
+
+> **Phase 10 — Meta-cognition layer. ⏳ PLANNED.**
+> A lightweight self-evaluation pass (§15): `reflect.py introspect` measures retrieval effectiveness,
+> procedural success rates, cognitive drift, context pollution, and attention instability from the
+> existing activation/thread history and procedure scores, emitting a `meta_assessment` event and a
+> `confidence` signal. It feeds strategy adaptation (e.g. widen retrieval when recall is poor, trigger
+> incubation/oscillation when fixation is detected) — bounded, single-pass, never recursive. *Outcome:
+> the system monitors its own reasoning quality and adapts, without instability.*
+
+> **Phase 11 — Pattern-to-procedure pipeline. ⏳ PLANNED.**
+> Close the loop (§16): when a detected pattern (Phase 8) is a *successful* recurring sequence with
+> confidence over threshold, consolidation promotes it into a procedural heuristic (Phase 9) via a
+> `pattern_promoted` event, which subsequent `proc_executed` reinforcement then optimizes. This is the
+> emergent path — observation → pattern → procedure → optimized strategy — that makes the system
+> *learn operationally* rather than merely store. *Outcome: emergent operational intelligence from the
+> one log.*
+
 Every phase maps to a measurable gain — Phases 0/5 to scalability, 2/3/4 to retrieval quality and
-reasoning coherence, 1/6 to continuity fidelity, 7 to evolvability — and none adds an always-on
-dependency.
+reasoning coherence, 1/6 to continuity fidelity, 7 to evolvability, 8–11 to adaptive cognition
+(pattern awareness, self-improving procedures, self-evaluation, emergent operational intelligence) —
+and none adds an always-on dependency.
 
 ---
 
@@ -538,3 +581,126 @@ happened* (episodic), *what it means* (semantic), and *how to proceed* (procedur
 a real attention system; consolidates episodes into durable knowledge offline; and scales to unlimited
 timescales by snapshotting the past while keeping the active graph small — all from one append-only log
 that remains the only truth.
+
+---
+
+# V4.1 extension — Adaptive cognition
+
+Sections 13–16 extend V4 from *persistent information storage* toward *persistent adaptive
+cognition*: the system should not only remember, but **learn, adapt, optimize, and predict**. Every
+addition here holds the V4 invariants verbatim — pure-stdlib default, local-first, `runtime/events.jsonl`
+as the only truth, every derived structure a rebuildable projection, optional accelerators degrade
+gracefully, single-agent behavior unchanged unless explicitly opted in, and absent fields/tables ⇒
+exactly current behavior. Patterns, execution outcomes, and meta-assessments are all **derived
+projections of new truth events**, never a second source of truth.
+
+## 13. Pattern recognition layer
+
+Memory retrieval recalls *what happened*. Pattern-aware cognition recognizes *what is happening
+again*. Patterns become **first-class memory objects** — a fourth `mem_class` ('pattern') alongside
+episodic/semantic/procedural — derived from the projected graph, never hand-authored.
+
+**What is mined** (a T2 offline pass, `patterns.py mine`, dry-run by default, `--apply` to emit):
+- **recurring reasoning structures** — repeated subgraph motifs in the causal DAG (same shape of
+  decision→action→outcome chain across threads).
+- **repeated failure modes** — causal chains that recurrently terminate in `assumption_invalidated`,
+  contradiction, or an unclosed loop.
+- **successful execution paths** — chains that recurrently reach `loop_closed` / passing artifacts.
+- **temporal correlations** — event types that reliably co-occur or follow within a thread window.
+- **cognitive bottlenecks / workflow inefficiencies** — nodes with high causal in-degree that
+  repeatedly stall progress; loops that re-open after closing (`loop recurrence`).
+- **cross-project conceptual similarity** — concepts whose evidence spans projects/branches and
+  cluster by resonance + vector similarity.
+
+**Storage (schema additions, gated by a `schema_version` bump):**
+```sql
+ALTER TABLE nodes ADD COLUMN mem_class ... ;   -- 'pattern' joins episodic/semantic/procedural
+CREATE TABLE patterns (
+    pattern_id   TEXT PRIMARY KEY,    -- pat_<slug>
+    kind         TEXT,                -- 'reasoning' | 'failure' | 'success' | 'temporal' | 'bottleneck' | 'similarity'
+    label        TEXT,
+    confidence   REAL DEFAULT 0.5,    -- support- and recency-weighted, in [0,1]
+    frequency    INTEGER DEFAULT 1,   -- # of observed instances
+    last_seen_t  TEXT,
+    recommended  TEXT,                -- JSON: recommended_actions
+    embedding_id INTEGER              -- nullable; FK into vectors
+);
+CREATE TABLE pattern_evidence (pattern_id TEXT, ref_kind TEXT, ref_id TEXT);  -- threads/events/concepts
+```
+A `pattern_detected` truth event (curator-owned, `agent="memory"`) carries the conclusion;
+`cognition._build_patterns` projects it. Each pattern is also a node, joined to its evidence by
+`pattern` edges (`EDGE_WEIGHT['pattern']`), so spreading activation **surfaces the pattern a live
+context is repeating** — e.g. activating a debugging thread lifts `pat_debugging-loop`. A
+**predictive pattern score** ranks which patterns are most likely active given the current working
+set (confidence × recency × activation overlap). Pure stdlib: motif and sequence detection run over
+the existing `edges`/`membership`/`causes` tables; vector similarity reuses the Phase-4 path and
+degrades to lexical when vectors are absent. Example object:
+```json
+{ "pattern_id": "pat_debugging-loop", "kind": "reasoning", "confidence": 0.91,
+  "frequency": 14, "associated_threads": ["thr_…"], "recommended_actions": ["bisect before patching"] }
+```
+
+## 14. Adaptive procedural learning
+
+Phase 3 stores procedures statically. V4.1 makes them **self-improving**: procedures learn from
+execution, reinforce what works, weaken what fails, and evolve.
+
+- **Execution tracking.** A new `proc_executed` truth event records each reuse:
+  `{procedure_id, outcome: "success"|"failure", thread_id, t}`. It is *episodic truth* — anyone may
+  emit it; the score it feeds is a curator projection.
+- **Reinforcement weighting.** `cognition._build_procedures` folds executions into `outcome_score`
+  via a bounded reinforcement update (success raises, failure lowers, with recency decay so old
+  outcomes fade) and updates `uses` / `last_used_t`. The score is a deterministic replay of the
+  execution log — no hidden state.
+- **Strategy optimization / execution-path scoring.** Competing procedures for the same `trigger`
+  are ranked by `outcome_score`; retrieval injects the best context-matched one ("last time this
+  worked: …").
+- **Adaptive workflow evolution + procedural abstraction.** Consolidation (§9 T2) may **synthesize**
+  a new procedure from a recurring successful pattern (the §16 pipeline), **generalize** a family of
+  near-identical successful chains into one heuristic, and **retire** chronically-failing procedures
+  (`procedure_retired`, mirroring `concept_retired`). Entropy caps bound new/generalized procedures
+  per pass, exactly like `ABSTRACT_MAX_NEW`.
+
+This answers, from the log alone: which workflows consistently succeed, which reasoning chains fail,
+which retrieval/planning approaches scale best — and steers future retrieval toward the winners.
+
+## 15. Meta-cognition layer
+
+A **lightweight, bounded** self-evaluation subsystem — *thinking about its own thinking* without
+runaway recursion. `reflect.py introspect` runs one pass (T1/T2, never inside an interactive turn)
+over already-derived signals:
+
+| Monitored | Source signal |
+|---|---|
+| retrieval effectiveness | hit-rate of seeded nodes that the turn actually used (activation → citation) |
+| procedural success rate | mean `outcome_score` of recently executed procedures (§14) |
+| cognitive drift | topic divergence between consecutive working sets (existing drift check, quantified) |
+| context pollution | share of cold / low-relevance nodes in the active window |
+| attention instability | activation-rank churn across refreshes (oscillation proxy) |
+
+It emits a `meta_assessment` event with a `confidence` scalar and per-metric readings — a curator
+projection, fully replayable. **Strategy adaptation** consumes it as bounded, declarative nudges:
+poor recall ⇒ widen retrieval (lower the seed threshold / add a lexical tier); detected fixation ⇒
+enable incubation/oscillation next pass; high pollution ⇒ trigger compaction. Single pass, no
+self-referential loop: meta-assessments are never themselves inputs to meta-assessment.
+
+## 16. Pattern-to-procedure pipeline
+
+The capstone that turns observation into operational skill:
+
+```
+observed pattern (§13)  →  procedural knowledge (§14)  →  optimized strategy
+```
+
+When a §13 pattern of `kind="success"` (a recurring successful sequence) exceeds a confidence
+threshold, the T2 consolidation pass promotes it into a procedure: it emits a `pattern_promoted`
+event linking `pattern_id → procedure_id`, and `_build_procedures` materializes the procedure with
+its `trigger` taken from the pattern's recurring entry context and its initial `outcome_score`
+seeded from the pattern confidence. Subsequent real uses emit `proc_executed` (§14), whose
+reinforcement then **optimizes** the promoted heuristic — closing the loop. Example:
+a recurring successful debugging sequence is detected → promoted into `prc_bisect-before-patch` →
+reinforced over future executions. Guards: only `success` patterns promote; promotion is idempotent
+(one procedure per pattern); a promoted procedure that then chronically fails is retired by §14, so
+a bad promotion self-corrects. This is the mechanism by which the system grows **emergent operational
+intelligence** — adaptive, optimizing, and predictive — rather than static memory retrieval, while
+every step remains a replayable projection of the one append-only log.
