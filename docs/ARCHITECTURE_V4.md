@@ -583,13 +583,24 @@ cognition**, then **scale-out**.
 > valid. Tests: `tests/test_phase10_metacognition.py`. *Outcome: the system monitors its own
 > reasoning quality and adapts, without instability.*
 
-> **Phase 11 — Pattern-to-procedure pipeline. ⏳ PLANNED.**
-> Close the loop (§16): when a detected pattern (Phase 8) is a *successful* recurring sequence with
-> confidence over threshold, consolidation promotes it into a procedural heuristic (Phase 9) via a
-> `pattern_promoted` event, which subsequent `proc_executed` reinforcement then optimizes. This is the
-> emergent path — observation → pattern → procedure → optimized strategy — that makes the system
-> *learn operationally* rather than merely store. *Outcome: emergent operational intelligence from the
-> one log.*
+> **Phase 11 — Pattern-to-procedure pipeline. ✅ BUILT.**
+> Closes the loop (§16): a mined `kind="success"` pattern (Phase 8) whose confidence clears
+> `PROMOTE_CONF_FLOOR` (0.70) is promoted into a procedural heuristic (Phase 9). `reflect.py promote`
+> emits ONE curator `pattern_promoted` event linking `pattern_id → procedure_id` and carrying the
+> seed; `cognition._build_procedures` then materializes the procedure with its `steps` taken from the
+> pattern's defining recurring sequence, its `trigger` from the pattern's recurring entry context (the
+> contributing threads' objective/open_loop/error cues), and its initial `outcome_score` **seeded from
+> the pattern confidence** (the promotion itself is not counted as a `use` — only `proc_executed`/learn
+> reinforce). Subsequent real uses emit `proc_executed` (§14), whose reinforcement then *optimizes* the
+> promoted heuristic — observation → pattern → procedure → optimized strategy. Guards: only `success`
+> patterns promote; promotion is **idempotent** (one procedure per pattern — a pattern already linked by
+> a prior `pattern_promoted` is skipped, so a promotion §14-retirement withdrew is NOT silently revived;
+> the self-correction is sticky). `pattern_promoted` is curator-owned in both arbitration sets and
+> projects as a `layer='meta'` linkage node. Runs as the `[4/9]` stage of the `consolidate` sleep cycle
+> (right after pattern mining, so a pattern just recorded can close the loop within the same cycle) and
+> is also exposed as `reflect.py promote [--apply]` (dry-run by default). No SCHEMA_VERSION bump — the
+> event folds through the existing procedural projection, so existing caches stay valid. Tests:
+> `tests/test_phase11_promotion.py`. *Outcome: emergent operational intelligence from the one log.*
 
 Every phase maps to a measurable gain — Phases 0/5 to scalability, 2/3/4 to retrieval quality and
 reasoning coherence, 1/6 to continuity fidelity, 7 to evolvability, 8–11 to adaptive cognition

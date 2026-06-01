@@ -36,6 +36,8 @@ Subcommands:
                                            workflows (procedural memory; dry-run unless --apply)
     python reflect.py mine [--apply]       T2: detect recurring patterns (reasoning/failure/
                                            success/bottleneck) as first-class memory (§13)
+    python reflect.py promote [--apply]    T2: promote confident SUCCESS patterns into procedures
+                                           (pattern_promoted links pattern->procedure; §16)
     python reflect.py prune [--apply]      T2: retire stale concepts whose evidence went cold
                                            (semantic memory; dry-run unless --apply)
     python reflect.py retire-procedures [--apply]  T2: retire chronically-failing procedures by
@@ -44,9 +46,9 @@ Subcommands:
                                            reasoning quality (recall/procedural success/drift/
                                            pollution/instability) into a `meta_assessment` +
                                            confidence + strategy nudges (§15; dry-run unless --apply)
-    python reflect.py consolidate [--apply]  T2 pipeline: abstract + learn + mine + prune +
-                                           retire-procedures + snapshot + incubate + introspect
-                                           (the "sleep cycle"; dry-run unless --apply)
+    python reflect.py consolidate [--apply]  T2 pipeline: abstract + learn + mine + promote +
+                                           prune + retire-procedures + snapshot + incubate +
+                                           introspect (the "sleep cycle"; dry-run unless --apply)
     python reflect.py all                  reflect + compress
 
 Pure stdlib. Reuses cognition.build (graph) and runtime.append (truth log).
@@ -729,6 +731,113 @@ def mine(apply: bool = False, quiet: bool = False) -> dict:
     return {"proposals": proposals, "applied": applied}
 
 
+# ─── T2 pattern-to-procedure pipeline (§16, Phase 11) ────────────────────────────
+
+PROMOTE_CONF_FLOOR = 0.70   # only a SUCCESS pattern at least this confident becomes a procedure
+PROMOTE_MAX_NEW = 8         # entropy cap: promote at most this many patterns per pass
+
+
+def _promoted_proc_id(pattern_id: str) -> str:
+    """Deterministic one-to-one procedure id for a promoted pattern (idempotency key)."""
+    body = pattern_id[len("pat_success_"):] if pattern_id.startswith("pat_success_") else pattern_id
+    return f"prc_{_slug(body)}"
+
+
+def _promotion_steps_and_trigger(conn, pat: dict, ev_threads: list):
+    """Derive the promoted procedure's steps + trigger from the source pattern.
+
+    steps   = the pattern's defining recurring sequence (encoded in its label by `mine`),
+              which IS the reusable execution path — deterministic, independent of which
+              evidence episodes are still hot.
+    trigger = the pattern's recurring ENTRY context: the objective/open_loop/error cues of
+              the contributing threads (mirrors how `learn` derives a procedure trigger)."""
+    label = pat["label"] or ""
+    sig = label.split(":", 1)[1] if ":" in label else label
+    steps_desc = [s.strip() for s in sig.split("→") if s.strip()]
+    triggers: set = set()
+    if ev_threads:
+        tph = ",".join("?" * len(ev_threads))
+        cph = ",".join("?" * len(PROC_TRIGGER_TYPES))
+        for r in conn.execute(
+            f"SELECT n.body FROM nodes n JOIN membership m ON n.event_id=m.event_id "
+            f"WHERE m.thread_id IN ({tph}) AND n.type IN ({cph})",
+                ev_threads + list(PROC_TRIGGER_TYPES)):
+            triggers.update(_terms(r["body"] or ""))
+    trigger = sorted(triggers) or steps_desc[:1]
+    return steps_desc, trigger
+
+
+def promote(apply: bool = False, quiet: bool = False) -> dict:
+    """T2 pattern-to-procedure promotion (§16, Phase 11): close the loop that turns
+    observation into operational skill — observed pattern (§13) → procedural knowledge (§14)
+    → optimized strategy.
+
+    A mined pattern of `kind='success'` (a reusable execution path) whose confidence clears
+    PROMOTE_CONF_FLOOR is promoted into a procedural heuristic: this emits ONE curator
+    `pattern_promoted` event linking `pattern_id → procedure_id` and carrying the seed the
+    procedure is materialized from — its `trigger` taken from the pattern's recurring entry
+    context, its `steps` the pattern's defining sequence, its initial `outcome_score` the
+    pattern confidence. `cognition._build_procedures` then materializes the procedure; later
+    real uses emit `proc_executed` (§14), whose reinforcement OPTIMIZES the promoted heuristic.
+
+    Guards: only `success` patterns promote; promotion is idempotent (one procedure per
+    pattern — a pattern already linked by a prior `pattern_promoted` is skipped, so a promotion
+    that §14 later retired is NOT silently revived). Dry-run by default; --apply appends the
+    `pattern_promoted` events (agent='memory' — the curator owns consolidation)."""
+    import runtime
+    conn = _graph()
+    pats = [dict(r) for r in conn.execute(
+        "SELECT pattern_id, label, confidence FROM patterns "
+        "WHERE kind='success' AND confidence >= ? ORDER BY confidence DESC, pattern_id",
+        (PROMOTE_CONF_FLOOR,))]
+    proposals = []
+    for pat in pats:
+        pid = pat["pattern_id"]
+        ev = [dict(r) for r in conn.execute(
+            "SELECT ref_kind, ref_id FROM pattern_evidence WHERE pattern_id=?", (pid,))]
+        ev_threads = [r["ref_id"] for r in ev if r["ref_kind"] == "thread"]
+        ev_events = [r["ref_id"] for r in ev if r["ref_kind"] == "event"]
+        steps_desc, trigger = _promotion_steps_and_trigger(conn, pat, ev_threads)
+        label = pat["label"] or pid
+        if label.startswith("successful path:"):
+            label = "promoted workflow:" + label[len("successful path:"):]
+        proposals.append({
+            "pattern_id": pid,
+            "procedure_id": _promoted_proc_id(pid),
+            "label": label,
+            "trigger": trigger,
+            "steps": steps_desc,
+            "evidence": ev_events + ev_threads + [pid],
+            "confidence": round(pat["confidence"], 4),
+        })
+    conn.close()
+
+    # idempotency: a pattern already promoted (its link recorded in the log) is never re-promoted,
+    # so a retired promotion stays retired — the §14 self-correction is sticky.
+    promoted = {e.get("pattern_id") for e in runtime.read_events()
+                if e.get("type") == "pattern_promoted"}
+    proposals = [p for p in proposals if p["pattern_id"] not in promoted][:PROMOTE_MAX_NEW]
+
+    applied = []
+    if apply and proposals:
+        for p in proposals:
+            runtime.append("pattern_promoted", agent="memory", **p)
+            applied.append(p["procedure_id"])
+
+    if not quiet:
+        if not proposals:
+            print(f"  no patterns to promote (success patterns, conf >= {PROMOTE_CONF_FLOOR})")
+        elif apply:
+            print(f"  promoted {len(applied)} pattern(s) -> procedure(s): {', '.join(applied)}")
+        else:
+            print(f"  dry-run: {len(proposals)} promotable pattern(s). "
+                  "Re-run with --apply to promote:")
+            for p in proposals:
+                print(f"    {p['pattern_id']} -> {p['procedure_id']}  "
+                      f"(conf {p['confidence']}, {len(p['steps'])} steps)")
+    return {"proposals": proposals, "applied": applied}
+
+
 # ─── T1/T2 meta-cognition (§15): bounded self-evaluation of reasoning quality ────
 
 # All five readings are projections of *already-derived* signals — no new sensing, no
@@ -859,7 +968,8 @@ def introspect(apply: bool = False, quiet: bool = False, agent: str = "") -> dic
 
 def consolidate(apply: bool = False, quiet: bool = False) -> dict:
     """T2 consolidation pipeline (§9, §10): the offline "sleep cycle" run in order —
-    abstraction → procedure learning → stale-belief pruning → snapshot/compaction.
+    abstraction → procedure learning → pattern mining → pattern promotion → stale-belief
+    pruning → procedure retirement → snapshot/compaction → incubation → meta-cognition.
 
     Each stage is append-only and dry-run unless --apply, so this is the single entry point
     for opportunistic (idle / N-events / PreCompact) consolidation that never blocks an
@@ -868,22 +978,27 @@ def consolidate(apply: bool = False, quiet: bool = False) -> dict:
     import cognition
     if not quiet:
         print("T2 consolidation pipeline" + (" (--apply)" if apply else " (dry-run)") + ":")
-        print(" [1/8] abstraction")
+        print(" [1/9] abstraction")
     a = abstract(apply=apply, quiet=quiet)
     if not quiet:
-        print(" [2/8] procedure learning")
+        print(" [2/9] procedure learning")
     l = learn(apply=apply, quiet=quiet)
     if not quiet:
-        print(" [3/8] pattern mining")
+        print(" [3/9] pattern mining")
     m = mine(apply=apply, quiet=quiet)
+    # v4.1 Phase 11: promotion runs right after mining so the success patterns it just recorded
+    # can close the loop into procedures (materialized on the next build) within the same cycle.
     if not quiet:
-        print(" [4/8] stale-belief pruning")
+        print(" [4/9] pattern promotion")
+    pr = promote(apply=apply, quiet=quiet)
+    if not quiet:
+        print(" [5/9] stale-belief pruning")
     p = prune(apply=apply, quiet=quiet)
     if not quiet:
-        print(" [5/8] procedure retirement")
+        print(" [6/9] procedure retirement")
     rp = retire_procedures(apply=apply, quiet=quiet)
     if not quiet:
-        print(" [6/8] snapshot / compaction")
+        print(" [7/9] snapshot / compaction")
     s = cognition.snapshot(apply=apply)
     if not quiet:
         if apply:
@@ -894,7 +1009,7 @@ def consolidate(apply: bool = False, quiet: bool = False) -> dict:
     # runs on apply as the offline pass that lets dormant ideas resurface next session.
     inc = None
     if not quiet:
-        print(" [7/8] incubation")
+        print(" [8/9] incubation")
     if apply:
         inc = cognition.incubate()
         if not quiet:
@@ -904,9 +1019,9 @@ def consolidate(apply: bool = False, quiet: bool = False) -> dict:
     # v4.1 Phase 10: meta-cognition runs LAST so it self-assesses the state this cycle leaves
     # behind. It reads only already-derived signals and never feeds itself (no recursion).
     if not quiet:
-        print(" [8/8] meta-cognition")
+        print(" [9/9] meta-cognition")
     mc = introspect(apply=apply, quiet=quiet)
-    return {"abstract": a, "learn": l, "mine": m, "prune": p,
+    return {"abstract": a, "learn": l, "mine": m, "promote": pr, "prune": p,
             "retire_procedures": rp, "snapshot": s, "incubate": inc, "introspect": mc}
 
 
@@ -1020,6 +1135,8 @@ def main(argv):
         learn(apply="--apply" in rest, quiet="--quiet" in rest); return 0
     if cmd == "mine":
         mine(apply="--apply" in rest, quiet="--quiet" in rest); return 0
+    if cmd == "promote":
+        promote(apply="--apply" in rest, quiet="--quiet" in rest); return 0
     if cmd == "prune":
         prune(apply="--apply" in rest, quiet="--quiet" in rest); return 0
     if cmd == "retire-procedures":

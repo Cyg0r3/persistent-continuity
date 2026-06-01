@@ -150,6 +150,7 @@ CURATOR_TYPES = {
     "assumption_invalidated", "loop_closed", "snapshot",
     "pattern_detected", "procedure_retired",
     "meta_assessment",   # v4.1 Phase 10: curator self-evaluation conclusion
+    "pattern_promoted",  # v4.1 Phase 11: curator pattern->procedure promotion conclusion
 }
 
 
@@ -702,12 +703,16 @@ def _build_procedures(conn, events: list) -> None:
             p["uses"] += 1
             p["last_t"] = e.get("t") or p["last_t"]
             continue
-        if et != "procedure_learned":
+        # v4.1 Phase 11 (§16): `pattern_promoted` seeds a procedure from a mined success pattern,
+        # exactly as `procedure_learned` does, except its initial outcome_score is taken from the
+        # source pattern's confidence and the promotion itself is not counted as a use (it is a
+        # materialization, not a recorded execution — only proc_executed/learn reinforce `uses`).
+        if et not in ("procedure_learned", "pattern_promoted"):
             continue
         pid = _procedure_id_of(e)
         if not pid:
             continue
-        retired.discard(pid)                  # re-learning revives a previously retired procedure
+        retired.discard(pid)                  # (re)learning or promoting revives a retired procedure
         ev = _as_list(e.get("evidence"))
         p = acc.setdefault(pid, {"label": "", "steps": [], "trigger": [], "score": None,
                                  "uses": 0, "evidence": set(), "last_t": e.get("t")})
@@ -721,10 +726,13 @@ def _build_procedures(conn, events: list) -> None:
         elif isinstance(steps, str) and steps:
             p["steps"] = [steps]
         p["evidence"].update(ev)
-        p["uses"] += 1                       # each learned/reinforced emission = one use
         p["last_t"] = e.get("t") or p["last_t"]
+        if et == "procedure_learned":
+            p["uses"] += 1                   # each learned/reinforced emission = one use
         if e.get("outcome_score") is not None:
             p["score"] = float(e["outcome_score"])
+        elif et == "pattern_promoted" and p["score"] is None and e.get("confidence") is not None:
+            p["score"] = float(e["confidence"])   # seed initial score from the pattern's confidence
     for pid, p in acc.items():
         if pid in retired:
             continue                          # chronically-failing procedure withdrawn by curator

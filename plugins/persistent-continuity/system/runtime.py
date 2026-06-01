@@ -74,6 +74,9 @@ KNOWN_TYPES = {
     "proc_executed", "procedure_retired",
     # v4.1 Phase 10 meta-cognition: the curator's bounded self-evaluation of reasoning quality
     "meta_assessment",
+    # v4.1 Phase 11 pattern-to-procedure pipeline: the curator promotes a recurring success
+    # pattern into a procedural heuristic, linking pattern_id -> procedure_id (§16)
+    "pattern_promoted",
 }
 
 # v4 Phase 7 multi-agent arbitration (§10): the memory curator owns consolidation. These
@@ -90,6 +93,9 @@ CURATOR_TYPES = {
     # v4.1 Phase 10: the meta-cognitive self-assessment is a curator conclusion (a projection of
     # already-derived signals; emitting one under a named non-curator agent is auditable)
     "meta_assessment",
+    # v4.1 Phase 11: promoting a mined pattern into a procedure is a consolidation conclusion the
+    # curator owns (proc_executed reinforcement that follows is NOT — anyone executes the workflow)
+    "pattern_promoted",
 }
 
 

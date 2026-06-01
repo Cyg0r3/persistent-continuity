@@ -19,7 +19,7 @@ attention instability), folds them into a `confidence` scalar plus declarative s
      a log that already contains assessments reports the same metric set and never feeds itself.
   6. The assessment is replayable truth: it projects as a layer='meta' node and the curator audit
      stays clean.
-  7. The T2 consolidation "sleep cycle" runs meta-cognition as its final [8/8] stage.
+  7. The T2 consolidation "sleep cycle" runs meta-cognition as its final stage.
 
 Pure stdlib (unittest + subprocess), matching the project's no-dependency invariant.
 Run: python tests/test_phase10_metacognition.py
@@ -215,7 +215,7 @@ class Phase10Meta(unittest.TestCase):
     def test_consolidate_runs_metacognition_stage(self):
         warm(self.home)
         out = run(REFLECT, "consolidate", "--apply", home=self.home).stdout
-        self.assertIn("[8/8] meta-cognition", out)
+        self.assertIn("[9/9] meta-cognition", out)
         # the sleep cycle recorded a meta_assessment as its final act
         self.assertIsNotNone(last_meta(self.home))
 
