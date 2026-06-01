@@ -235,11 +235,11 @@ _STOPWORDS = {
     "after", "before", "over", "under", "your", "you", "our", "but", "not",
     "all", "any", "can", "out", "via", "use", "used", "using", "per", "its",
 }
-_WORD = re.compile(r"[a-z][a-z0-9_-]{3,}")
+_WORD = re.compile(r"[a-z][a-z0-9_-]{2,}")
 
 
 def _terms(body: str) -> set:
-    """Significant lowercased terms in an episode body (stopword-filtered, len>=4)."""
+    """Significant lowercased terms in an episode body (stopword-filtered, len>=3)."""
     return {w for w in _WORD.findall((body or "").lower()) if w not in _STOPWORDS}
 
 
