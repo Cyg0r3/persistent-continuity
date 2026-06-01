@@ -17,13 +17,20 @@ extraction (NOT session replay). Determinism is at the event layer: same events 
 intent seed => same subgraph.
 
 Subcommands:
-    python cognition.py build                 Rebuild the graph (cognition.db) from events
+    python cognition.py build [--force]       Build the graph (cognition.db) from events
+                                              (skips when up-to-date; --force always rebuilds)
     python cognition.py attend [query] [-n N]  Compute attention; show top active nodes/threads
     python cognition.py context [query] [--write]  Synthesize the dynamic workspace lens
     python cognition.py threads                List threads with state (active/dormant/merged)
     python cognition.py subgraph [query] [-n N]    Show the extracted active subgraph
+    python cognition.py roles                  List multi-agent roles and their focus types
     python cognition.py refresh [--hook]       Stage-4 adaptive refresh: on topic drift,
                                                checkpoint + re-inject fresh workspace
+
+Multi-agent (§9): attend/context/subgraph accept --agent <planner|coder|researcher|memory>
+and --threads <t1,t2> to compute a role-biased attention WINDOW over the one shared graph
+(constrained seed, full-graph spread; per-agent attention persistence). No --agent => the
+single-agent path, unchanged.
 
 Pure stdlib. Reuses retrieval.salience as base activation and runtime.read_events as the
 single event-reading contract; both degrade to local fallbacks if unavailable.
@@ -69,6 +76,29 @@ REINFORCE_TOP_N = 3    # how many focus nodes get an `attended` event on reinfor
 
 EDGE_WEIGHT = {"causal": 1.0, "membership": 0.7, "thread_rel": 0.4,
                "contradiction": 0.0}  # contradiction handled by inhibition, not spread
+
+# ── multi-agent attention windows (ARCHITECTURE_V3.md §9) ────────────────────
+# Each agent computes its OWN attention over the ONE shared graph: same engine,
+# a role-biased SEED (not a separate store). A window is a constrained seed —
+# spreading still runs over the full graph so cross-agent context stays reachable
+# (soft bias, not a hard filter). `agent=None`/'' is the single-agent path today.
+ROLE_SEED = 0.55          # weight applied to a node whose type matches the role's focus
+ASSIGNED_THREAD_BOOST = 0.65   # seed lift for members of an agent's assigned threads
+# role -> event types the agent's attention is biased toward (the rest still spread in).
+ROLE_PROFILES = {
+    "planner":    {"objective", "open_loop", "decision", "reflection", "topic_shift"},
+    "coder":      {"artifact", "command", "output", "error", "api_call"},
+    "researcher": {"observation", "hypothesis", "contradiction", "assumption"},
+    "memory":     {"contradiction", "assumption", "assumption_invalidated",
+                   "open_loop", "reflection"},
+}
+
+
+def role_types(agent: str):
+    """Focus event types for a role, or None for an unknown/blank agent (no bias)."""
+    if not agent:
+        return None
+    return ROLE_PROFILES.get(agent.lower())
 
 
 # ── reuse v2 base scoring; degrade locally if retrieval is unavailable ───────
@@ -160,21 +190,58 @@ CREATE TABLE threads (
     status TEXT, merged_into TEXT, n_events INTEGER DEFAULT 0
 );
 CREATE TABLE activation (
-    event_id TEXT PRIMARY KEY, base REAL, activation REAL, reinforced INTEGER DEFAULT 0
+    agent TEXT DEFAULT '', event_id TEXT, base REAL, activation REAL,
+    reinforced INTEGER DEFAULT 0, PRIMARY KEY (agent, event_id)
 );
 CREATE TABLE thread_activation (
-    thread_id TEXT PRIMARY KEY, activation REAL, resurfaced INTEGER DEFAULT 0
+    agent TEXT DEFAULT '', thread_id TEXT, activation REAL, resurfaced INTEGER DEFAULT 0,
+    PRIMARY KEY (agent, thread_id)
 );
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX ix_mem_thread ON membership(thread_id);
 CREATE INDEX ix_edges_dst ON edges(dst);
 CREATE INDEX ix_edges_src ON edges(src);
 """
 
 
-def build(db_path: Path = COG_DB) -> dict:
-    """Rebuild the cognitive graph from zero (drop-and-rebuild = pure projection)."""
+def _build_watermark(db_path: Path) -> int:
+    """Event count the current cognition.db was built from, or -1 if unknown/stale.
+
+    Returns -1 (forcing a rebuild) whenever the DB is missing or predates the v4
+    `meta` table, so an older cache never silently satisfies the watermark check."""
+    if not db_path.exists():
+        return -1
+    try:
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key='event_count'").fetchone()
+        conn.close()
+        return int(row[0]) if row else -1
+    except sqlite3.Error:
+        return -1
+
+
+def build(db_path: Path = COG_DB, force: bool = False) -> dict:
+    """Rebuild the cognitive graph from zero (drop-and-rebuild = pure projection).
+
+    v4 Phase 0 — watermark skip: the graph is a pure function of the event log, so if
+    the log hasn't grown since the last build the existing cognition.db is already a
+    correct projection and we skip the O(N) rebuild. `force=True` always rebuilds
+    (full-rebuild fallback for integrity / schema changes). Correctness still rests on
+    the log; the watermark only avoids redundant work."""
     events = read_events()
     RUNTIME.mkdir(parents=True, exist_ok=True)
+    if not force and _build_watermark(db_path) == len(events):
+        conn = sqlite3.connect(db_path)
+        summary = {
+            "events": len(events),
+            "nodes": conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0],
+            "threads": conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0],
+            "edges": conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
+            "skipped": True,
+        }
+        conn.close()
+        return summary
     if db_path.exists():
         db_path.unlink()
     conn = sqlite3.connect(db_path)
@@ -272,12 +339,16 @@ def build(db_path: Path = COG_DB) -> dict:
             (tid, th["title"], th["opened_t"], th["last_activity_t"],
              th["status"], th["merged_into"], th["n_events"]))
 
+    # watermark: record the event count this build is a projection of (v4 Phase 0)
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('event_count',?)",
+                 (str(len(events)),))
     conn.commit()
     summary = {
         "events": len(events),
         "nodes": conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0],
         "threads": len(threads),
         "edges": conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
+        "skipped": False,
     }
     conn.close()
     _export_threads(summary)
@@ -313,9 +384,14 @@ def _base_activation(row) -> float:
     return round(0.5 * imp + 0.3 * rec + 0.2 * unres + reinf, 4)
 
 
-def _seed(conn, query: str) -> dict:
+def _seed(conn, query: str, agent: str = "", threads=None) -> dict:
     """Seed activation: query matches (via retrieval BM25 if available) + every
-    unresolved open loop + nodes in currently-active threads."""
+    unresolved open loop + nodes in currently-active threads.
+
+    Multi-agent (§9): when `agent` names a role, nodes whose type matches the role's
+    focus get an extra ROLE_SEED lift, and members of the agent's `threads` (its
+    assignment) get an ASSIGNED_THREAD_BOOST. This is a SOFT bias on the seed only —
+    spreading still happens over the full shared graph. `agent=''` => unchanged."""
     seed = {}
     # unresolved loops always seeded (bias to finishing)
     for r in conn.execute("SELECT event_id FROM nodes WHERE unresolved=1"):
@@ -328,6 +404,22 @@ def _seed(conn, query: str) -> dict:
         for r in conn.execute(
                 f"SELECT event_id FROM membership WHERE thread_id IN ({q})", active):
             seed[r[0]] = max(seed.get(r[0], 0.0), 0.5)
+    # role-biased seeding: lift nodes matching this agent's focus types. ADDITIVE
+    # overlay (not max) so the role actually reweights the window above the shared
+    # floors (active-thread 0.5, unresolved 0.9); spreading is still over the full graph.
+    focus = role_types(agent)
+    if focus:
+        q = ",".join("?" * len(focus))
+        for r in conn.execute(
+                f"SELECT event_id FROM nodes WHERE type IN ({q})", list(focus)):
+            seed[r[0]] = seed.get(r[0], 0.0) + ROLE_SEED
+    # assigned-thread boost: this agent's lane gets lifted, but not walled off
+    assigned = _as_list(threads)
+    if assigned:
+        q = ",".join("?" * len(assigned))
+        for r in conn.execute(
+                f"SELECT event_id FROM membership WHERE thread_id IN ({q})", assigned):
+            seed[r[0]] = seed.get(r[0], 0.0) + ASSIGNED_THREAD_BOOST
     # query relevance: dense (if enabled) -> BM25 -> lexical LIKE. Graceful 3-tier chain.
     if query:
         dense = []
@@ -397,8 +489,13 @@ class _Embedder:
 _EMBEDDER = _Embedder()  # singleton; cheap when disabled
 
 
-def attend(query: str = "", persist: bool = True) -> dict:
+def attend(query: str = "", persist: bool = True, agent: str = "", threads=None) -> dict:
     """Compute the attention state via spreading activation over the graph.
+
+    `agent` (+ optional `threads` assignment) selects a role-biased attention window
+    over the ONE shared graph (§9): the seed is constrained, the spread is not.
+    Attention persistence is scoped per agent so concurrent windows never bleed.
+    `agent=''` is the single-agent path (unchanged).
 
     Returns {"nodes": {eid: activation}, "threads": {tid: activation},
              "resurfaced": [tid], "contradictions": [(a,b,score_a,score_b)]}."""
@@ -421,8 +518,8 @@ def attend(query: str = "", persist: bool = True) -> dict:
         back = w if r["kind"] != "causal" else w * 0.6  # effect->cause weaker
         out_adj.setdefault(r["dst"], []).append((r["src"], back))
 
-    # seed
-    seed = _seed(conn, query)
+    # seed (role-biased when an agent window is requested)
+    seed = _seed(conn, query, agent=agent, threads=threads)
     act = {eid: base[eid] + seed.get(eid, 0.0) for eid in nodes}
 
     # spreading activation, bounded hops
@@ -451,10 +548,11 @@ def attend(query: str = "", persist: bool = True) -> dict:
             act[b] = max(0.0, act[b] - INHIBITION * snap[a])
     contradictions = [(a, b, round(act[a], 4), round(act[b], 4)) for a, b in pairs]
 
-    # attention persistence (blend with previous cycle)
+    # attention persistence (blend with previous cycle) — scoped to this agent window
     if persist:
         prev = {r["event_id"]: r["activation"]
-                for r in conn.execute("SELECT event_id,activation FROM activation")}
+                for r in conn.execute(
+                    "SELECT event_id,activation FROM activation WHERE agent=?", (agent,))}
         if prev:
             for eid in act:
                 act[eid] = ALPHA * act[eid] + (1 - ALPHA) * prev.get(eid, 0.0)
@@ -473,15 +571,17 @@ def attend(query: str = "", persist: bool = True) -> dict:
                 act[m] = act.get(m, 0.0) + RESURFACE_BONUS * 0.5
         thread_act[tid] = round(score, 4)
 
-    # persist the new attention state (transient cache)
-    conn.execute("DELETE FROM activation")
+    # persist the new attention state (transient cache), scoped to this agent window
+    conn.execute("DELETE FROM activation WHERE agent=?", (agent,))
     conn.executemany(
-        "INSERT INTO activation(event_id,base,activation) VALUES (?,?,?)",
-        [(eid, base[eid], round(act[eid], 4)) for eid in nodes])
-    conn.execute("DELETE FROM thread_activation")
+        "INSERT INTO activation(agent,event_id,base,activation) VALUES (?,?,?,?)",
+        [(agent, eid, base[eid], round(act[eid], 4)) for eid in nodes])
+    conn.execute("DELETE FROM thread_activation WHERE agent=?", (agent,))
     conn.executemany(
-        "INSERT INTO thread_activation(thread_id,activation,resurfaced) VALUES (?,?,?)",
-        [(tid, sc, 1 if tid in resurfaced else 0) for tid, sc in thread_act.items()])
+        "INSERT INTO thread_activation(agent,thread_id,activation,resurfaced) "
+        "VALUES (?,?,?,?)",
+        [(agent, tid, sc, 1 if tid in resurfaced else 0)
+         for tid, sc in thread_act.items()])
     conn.commit()
     conn.close()
 
@@ -492,9 +592,12 @@ def attend(query: str = "", persist: bool = True) -> dict:
 
 # ─── active subgraph extraction + workspace synthesis (§6, §7) ───────────────
 
-def active_subgraph(query: str = "", top_n: int = 8) -> dict:
-    """Top-activation nodes expanded <=HOP_LIMIT hops = the active subgraph."""
-    state = attend(query)
+def active_subgraph(query: str = "", top_n: int = 8, agent: str = "", threads=None) -> dict:
+    """Top-activation nodes expanded <=HOP_LIMIT hops = the active subgraph.
+
+    `agent`/`threads` select a role-biased window (§9); defaults reproduce the
+    single-agent subgraph exactly."""
+    state = attend(query, agent=agent, threads=threads)
     conn = sqlite3.connect(COG_DB)
     conn.row_factory = sqlite3.Row
     ranked = sorted(state["nodes"].items(), key=lambda kv: kv[1], reverse=True)
@@ -526,13 +629,17 @@ def active_subgraph(query: str = "", top_n: int = 8) -> dict:
             "contradictions": state["contradictions"], "core": core}
 
 
-def workspace(query: str = "", top_n: int = 8, reinforce: bool = False) -> str:
+def workspace(query: str = "", top_n: int = 8, reinforce: bool = False,
+              agent: str = "", threads=None) -> str:
     """Synthesize the ephemeral attention lens over the active subgraph (L4).
     This REPLACES stored working_context; writing it to disk is debug/export only.
 
     reinforce=True emits an `attended` event for the top focus nodes (§5.3) so that
-    what the workspace surfaces gains a replayable reinforcement floor next build."""
-    sg = active_subgraph(query, top_n)
+    what the workspace surfaces gains a replayable reinforcement floor next build.
+    `agent`/`threads` select a role-biased window (§9); the reinforcement is tagged
+    with the agent for provenance but its base-activation floor stays global (truth
+    about the shared graph, not private to one window)."""
+    sg = active_subgraph(query, top_n, agent=agent, threads=threads)
     conn = sqlite3.connect(COG_DB)
     conn.row_factory = sqlite3.Row
     th_meta = {r["thread_id"]: r for r in conn.execute("SELECT * FROM threads")}
@@ -543,7 +650,7 @@ def workspace(query: str = "", top_n: int = 8, reinforce: bool = False) -> str:
     loops = [n for n in cognitive if n["type"] == "open_loop"]
 
     if reinforce and cognitive:
-        _reinforce_attended([n["event_id"] for n in cognitive[:REINFORCE_TOP_N]])
+        _reinforce_attended([n["event_id"] for n in cognitive[:REINFORCE_TOP_N]], agent)
 
     L = []
     L.append(f"# Workspace @ {now_iso()} "
@@ -581,13 +688,17 @@ def workspace(query: str = "", top_n: int = 8, reinforce: bool = False) -> str:
     return "\n".join(L) + "\n"
 
 
-def _reinforce_attended(event_ids: list) -> None:
+def _reinforce_attended(event_ids: list, agent: str = "") -> None:
     """Emit one `attended` event per focus node (reinforcement is replayable truth).
-    Best-effort: never block workspace synthesis on logging."""
+    Tag with `agent` for provenance when fired from an agent window. Best-effort:
+    never block workspace synthesis on logging."""
     try:
         import runtime
         for eid in event_ids:
-            runtime.append("attended", target=eid)
+            if agent:
+                runtime.append("attended", target=eid, agent=agent)
+            else:
+                runtime.append("attended", target=eid)
     except Exception as exc:
         print(f"  (reinforcement not logged: {exc})", file=sys.stderr)
 
@@ -658,23 +769,41 @@ def main(argv):
         return 0
 
     if cmd == "build":
-        s = build()
-        print(f"Graph built from {s['events']} events: {s['nodes']} nodes, "
+        s = build(force="--force" in rest)
+        verb = "up-to-date (skipped rebuild)" if s.get("skipped") else "built"
+        print(f"Graph {verb} from {s['events']} events: {s['nodes']} nodes, "
               f"{s['threads']} threads, {s['edges']} edges -> "
               f"{COG_DB.relative_to(ROOT)}")
         return 0
+
+    def _opt(r, name):
+        """Pull `--name value` out of arglist r; return (value_or_None, remaining)."""
+        if name in r:
+            i = r.index(name)
+            val = r[i + 1] if i + 1 < len(r) else None
+            return val, r[:i] + r[i + 2:]
+        return None, r
 
     def _q_and_n(default_n):
         n = default_n
         r = rest
         if "-n" in r:
             i = r.index("-n"); n = int(r[i + 1]); r = r[:i] + r[i + 2:]
+        agent, r = _opt(r, "--agent")
+        threads, r = _opt(r, "--threads")
         r = [a for a in r if not a.startswith("--")]
-        return " ".join(r), n
+        return " ".join(r), n, (agent or ""), threads
+
+    if cmd == "roles":
+        print("agent roles (ARCHITECTURE_V3.md §9) — focus types per role:")
+        for role, types in ROLE_PROFILES.items():
+            print(f"  {role:<11} {', '.join(sorted(types))}")
+        print("\nusage: attend|context|subgraph --agent <role> [--threads t1,t2]")
+        return 0
 
     if cmd == "attend":
-        query, n = _q_and_n(10)
-        st = attend(query)
+        query, n, agent, threads = _q_and_n(10)
+        st = attend(query, agent=agent, threads=threads)
         ranked = sorted(st["nodes"].items(), key=lambda kv: kv[1], reverse=True)[:n]
         conn = sqlite3.connect(COG_DB); conn.row_factory = sqlite3.Row
         bodies = {r["event_id"]: r["body"] for r in conn.execute(
@@ -691,8 +820,9 @@ def main(argv):
         return 0
 
     if cmd == "context":
-        query, _ = _q_and_n(8)
-        text = workspace(query, reinforce="--reinforce" in rest)
+        query, _, agent, threads = _q_and_n(8)
+        text = workspace(query, reinforce="--reinforce" in rest,
+                         agent=agent, threads=threads)
         print(text)
         if "--write" in rest:
             WORKING_CONTEXT.write_text(text, encoding="utf-8")
@@ -700,8 +830,8 @@ def main(argv):
         return 0
 
     if cmd == "subgraph":
-        query, n = _q_and_n(8)
-        sg = active_subgraph(query, n)
+        query, n, agent, threads = _q_and_n(8)
+        sg = active_subgraph(query, n, agent=agent, threads=threads)
         for node in sg["nodes"]:
             print(f"  [{node['activation']:.3f}] ({node['layer']}/{node['type']}) "
                   f"{node['event_id']}  {node['body'][:80]}")

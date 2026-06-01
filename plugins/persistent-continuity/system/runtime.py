@@ -34,6 +34,8 @@ from _paths import data_root
 ROOT = data_root()
 RUNTIME = ROOT / "runtime"
 EVENTS = RUNTIME / "events.jsonl"
+SEQ_FILE = RUNTIME / "seq"          # persisted event counter (v4 Phase 0): kills the
+                                    # O(N)-per-append log scan that made id assignment O(N²)
 WORKING_CONTEXT = RUNTIME / "working_context.md"
 ACTIVE_CONTEXT = RUNTIME / "active_context.json"
 SESSION_STATE = RUNTIME / "session_state.json"
@@ -96,19 +98,58 @@ def parse_iso(s: str) -> datetime:
 
 # ─── L1: event log (truth) ───────────────────────────────────────────────────
 
+def _count_events() -> int:
+    """Count events by streaming the log (no full parse). Used only to (re)seed the
+    persisted counter — the slow path we are replacing for steady-state appends."""
+    if not EVENTS.exists():
+        return 0
+    n = 0
+    with EVENTS.open("r", encoding="utf-8") as fh:
+        for raw in fh:
+            if raw.strip():
+                n += 1
+    return n
+
+
+def _read_seq() -> int:
+    """Current persisted event count, or None if absent/unreadable (caller reseeds)."""
+    try:
+        return int(SEQ_FILE.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def next_seq() -> int:
+    """Allocate the next 1-based event sequence number in O(1) (v4 Phase 0).
+
+    Truth is still the log; `seq` is a rebuildable cache. If it is missing or has
+    drifted below the actual line count (e.g. the log was edited out-of-band), it
+    self-heals by re-counting — so correctness never depends on the cache being right,
+    only its speed does."""
+    cur = _read_seq()
+    if cur is None or cur < _count_events():
+        cur = _count_events()
+    nxt = cur + 1
+    SEQ_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SEQ_FILE.write_text(str(nxt), encoding="utf-8")
+    return nxt
+
+
 def append(event_type: str, **fields) -> dict:
     """Validate and append one event as a JSON line. Never edits existing lines.
 
     v3: assigns a stable `event_id` (evt_<seq>) and infers `layer` from type when
     not supplied; `thread_ids`/`causes` accept a list or comma-string. All v3 fields
-    are optional — omitting them yields exactly a v2 event (backward compatible)."""
+    are optional — omitting them yields exactly a v2 event (backward compatible).
+    v4 Phase 0: the `event_id` sequence comes from a persisted O(1) counter
+    (`runtime/seq`) instead of re-reading the whole log on every append."""
     if not event_type or not isinstance(event_type, str):
         raise ValueError("event requires a non-empty string 'type'")
     event = {"t": fields.pop("t", now_iso()), "type": event_type}
 
     # v3 graph fields (kept out of the dict when empty to stay v2-clean).
     if "event_id" not in fields:
-        fields["event_id"] = f"evt_{len(read_events()) + 1}"
+        fields["event_id"] = f"evt_{next_seq()}"
     if "layer" not in fields:
         fields["layer"] = infer_layer(event_type)
     for k in ("thread_ids", "causes"):

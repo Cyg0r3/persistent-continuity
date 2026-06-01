@@ -9,6 +9,7 @@ venv/
 .continuity/
 **/runtime/events.jsonl
 **/runtime/*.db
+**/runtime/seq
 **/index/*.db
 **/index/cursor
 
