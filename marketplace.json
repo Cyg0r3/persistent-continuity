@@ -1,0 +1,140 @@
+{
+  "name": "Persistent Continuity",
+  "slug": "persistent-continuity",
+  "version": "3.0.0",
+  "description": "A persistent continuity and memory architecture for Claude Code that enables resumable cognition, operational continuity, multi-session persistence, and intelligent project state restoration.",
+  "author": {
+    "name": "Cyg0r3",
+    "url": "https://github.com/Cyg0r3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Cyg0r3/persistent-continuity"
+  },
+  "homepage": "https://github.com/Cyg0r3/persistent-continuity",
+  "license": "MIT",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "memory",
+    "persistent-memory",
+    "continuity",
+    "agentic-workflows",
+    "multi-session",
+    "context-management",
+    "ai-memory",
+    "llm-runtime",
+    "project-state",
+    "operational-continuity",
+    "cognitive-architecture",
+    "resume-system",
+    "developer-tools"
+  ],
+  "categories": [
+    "Developer Tools",
+    "AI Infrastructure",
+    "Agent Memory",
+    "Productivity"
+  ],
+  "icon": "brain",
+  "banner": {
+    "primaryColor": "#0F172A",
+    "secondaryColor": "#2563EB",
+    "accentColor": "#14B8A6"
+  },
+  "capabilities": [
+    {
+      "id": "continuity-ledgers",
+      "title": "Continuity Ledgers",
+      "description": "Maintains structured project continuity across sessions using persistent ledgers and handoff artifacts."
+    },
+    {
+      "id": "session-restoration",
+      "title": "Session Restoration",
+      "description": "Automatically restores operational context, decisions, plans, and active work state."
+    },
+    {
+      "id": "persistent-memory",
+      "title": "Persistent Memory",
+      "description": "Stores long-term architectural and procedural memory beyond Claude context windows."
+    },
+    {
+      "id": "project-awareness",
+      "title": "Project Awareness",
+      "description": "Tracks repository structure, execution history, and project-specific operational patterns."
+    },
+    {
+      "id": "handoff-system",
+      "title": "Session Handoffs",
+      "description": "Creates resumable execution handoffs for future Claude sessions."
+    }
+  ],
+  "installation": {
+    "steps": [
+      "Clone the repository into your local development environment.",
+      "Install dependencies and configure Claude Code integration.",
+      "Initialize continuity ledgers and persistent storage.",
+      "Enable automatic session restoration hooks.",
+      "Launch Claude Code with Persistent Continuity enabled."
+    ]
+  },
+  "configuration": {
+    "required": [],
+    "optional": [
+      {
+        "key": "continuity.autoRestore",
+        "type": "boolean",
+        "default": true,
+        "description": "Automatically restore previous project continuity state."
+      },
+      {
+        "key": "continuity.persistenceMode",
+        "type": "string",
+        "default": "hybrid",
+        "description": "Persistence backend mode: local, hybrid, or distributed."
+      },
+      {
+        "key": "continuity.handoffGeneration",
+        "type": "boolean",
+        "default": true,
+        "description": "Generate resumable session handoffs automatically."
+      }
+    ]
+  },
+  "entrypoints": {
+    "startup": "./continuity/init",
+    "restore": "./continuity/restore",
+    "finalize": "./continuity/finalize"
+  },
+  "compatibility": {
+    "platforms": [
+      "Windows",
+      "Linux",
+      "macOS"
+    ],
+    "runtimes": [
+      "Claude Code",
+      "Claude Desktop"
+    ]
+  },
+  "features": [
+    "Automatic continuity restoration",
+    "Persistent operational memory",
+    "Cross-session state persistence",
+    "Structured handoff generation",
+    "Project-native cognition",
+    "Procedural memory tracking",
+    "Decision history retention",
+    "Task resumption pipelines",
+    "Execution summarization",
+    "Long-term architectural memory"
+  ],
+  "media": {
+    "screenshots": [],
+    "videos": []
+  },
+  "support": {
+    "issues": "https://github.com/Cyg0r3/persistent-continuity/issues",
+    "discussions": "https://github.com/Cyg0r3/persistent-continuity/discussions"
+  }
+}
