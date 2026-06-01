@@ -34,10 +34,12 @@ Subcommands:
                                            (semantic memory; dry-run unless --apply)
     python reflect.py learn [--apply]      T2: learn procedures from recurring successful
                                            workflows (procedural memory; dry-run unless --apply)
+    python reflect.py mine [--apply]       T2: detect recurring patterns (reasoning/failure/
+                                           success/bottleneck) as first-class memory (§13)
     python reflect.py prune [--apply]      T2: retire stale concepts whose evidence went cold
                                            (semantic memory; dry-run unless --apply)
-    python reflect.py consolidate [--apply]  T2 pipeline: abstract + learn + prune + snapshot
-                                           (the offline "sleep cycle"; dry-run unless --apply)
+    python reflect.py consolidate [--apply]  T2 pipeline: abstract + learn + mine + prune +
+                                           snapshot (the offline "sleep cycle"; dry-run unless --apply)
     python reflect.py all                  reflect + compress
 
 Pure stdlib. Reuses cognition.build (graph) and runtime.append (truth log).
@@ -508,6 +510,164 @@ def prune(apply: bool = False, quiet: bool = False) -> dict:
     return {"proposals": proposals, "applied": applied}
 
 
+# ─── T2 pattern recognition (§13): recurring patterns as first-class memory ──────
+
+PATTERN_MIN_SUPPORT = 2    # a pattern must recur across >= this many distinct threads
+PATTERN_MAX_NEW = 10       # cap patterns emitted per pass (entropy bound, §9)
+PATTERN_MOTIF_LEN = 3      # reasoning-motif length (contiguous type n-gram)
+BOTTLENECK_MIN_DEPS = 3    # causal dependents at/above which a node is a candidate bottleneck
+# cognitive types whose ORDER forms a recurring reasoning structure
+REASON_TYPES = ("objective", "hypothesis", "observation", "contradiction",
+                "decision", "reflection", "open_loop", "loop_closed", "assumption")
+# signals that a thread hit a failure mode
+FAILURE_TYPES = ("assumption_invalidated", "contradiction", "error")
+# actionable step types whose leading-term sequence signatures a successful run (mirrors learn)
+SUCCESS_STEP_TYPES = ("command", "artifact", "api_call", "decision")
+
+
+def mine(apply: bool = False, quiet: bool = False) -> dict:
+    """T2 pattern mining (§13): detect recurring patterns over the projected graph and
+    record them as first-class memory objects via `pattern_detected` (curator truth).
+
+    Deterministic, stdlib-only — a pure projection of the L2 graph. Four detectors:
+      • reasoning  — a contiguous n-gram of cognitive event TYPES recurring across threads
+                     (a repeated reasoning structure, e.g. hypothesis→observation→decision);
+      • failure    — a failure signal (assumption_invalidated / contradiction / error) whose
+                     leading term recurs across threads (a repeated failure mode);
+      • success    — a successful run (thread reaching loop_closed) whose step leading-term
+                     sequence recurs across threads (a reusable execution path → §16 promote);
+      • bottleneck — a single node with many causal dependents inside a still-unresolved
+                     thread (a prerequisite that stalls progress).
+    Idempotent: pattern_ids already in the graph are skipped. Dry-run by default; --apply
+    emits `pattern_detected` (agent='memory' — the curator owns the pattern layer, §10).
+    Append-only; `cognition._build_patterns` projects it."""
+    conn = _graph()
+    existing = {r["pattern_id"] for r in conn.execute("SELECT pattern_id FROM patterns")}
+    rows = [dict(r) for r in conn.execute(
+        "SELECT n.event_id, n.seq, n.type, n.body, n.unresolved, m.thread_id "
+        "FROM nodes n JOIN membership m ON n.event_id=m.event_id "
+        "WHERE n.seq IS NOT NULL ORDER BY m.thread_id, n.seq")]
+    # causal dependents = how many events list this node as a cause (out-degree of src):
+    # a node many others depend on is a prerequisite that can stall progress.
+    deps: dict = {}
+    for r in conn.execute("SELECT src, COUNT(*) c FROM edges WHERE kind='causal' GROUP BY src"):
+        deps[r["src"]] = r["c"]
+    conn.close()
+
+    by_thread: dict = {}
+    for r in rows:
+        by_thread.setdefault(r["thread_id"], []).append(r)
+
+    proposals: list = []
+
+    def _add(pid, kind, label, support, evidence, recommended):
+        if pid in existing or any(p["pattern_id"] == pid for p in proposals):
+            return
+        proposals.append({
+            "pattern_id": pid, "kind": kind, "label": label,
+            "confidence": round(min(0.95, 0.5 + 0.1 * (support - 1)), 4),
+            "frequency": support, "evidence": evidence,
+            "recommended": recommended,
+        })
+
+    # (1) reasoning motifs: recurring contiguous n-gram of cognitive TYPES across threads
+    motifs: dict = {}
+    for tid, evs in by_thread.items():
+        seq = [e["type"] for e in evs if e["type"] in REASON_TYPES]
+        for i in range(len(seq) - PATTERN_MOTIF_LEN + 1):
+            gram = tuple(seq[i:i + PATTERN_MOTIF_LEN])
+            motifs.setdefault(gram, set()).add(tid)
+    for gram, tids in sorted(motifs.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        if len(tids) < PATTERN_MIN_SUPPORT:
+            continue
+        _add(f"pat_reason_{_slug('-'.join(gram))}", "reasoning",
+             "reasoning structure: " + " → ".join(gram),
+             len(tids), sorted(tids),
+             [f"recurring reasoning path {' → '.join(gram)} — reuse or examine it"])
+
+    # (2) failure modes: a failure signal whose leading term recurs across threads
+    fail_groups: dict = {}
+    for tid, evs in by_thread.items():
+        for e in evs:
+            is_fail = e["type"] in FAILURE_TYPES or (
+                e["type"] == "open_loop" and e["unresolved"])
+            if not is_fail:
+                continue
+            term = _lead(e["body"])
+            if not term:
+                continue
+            g = fail_groups.setdefault(term, {"threads": set(), "evidence": set()})
+            g["threads"].add(tid)
+            g["evidence"].add(e["event_id"])
+    for term, g in sorted(fail_groups.items(), key=lambda kv: (-len(kv[1]["threads"]), kv[0])):
+        if len(g["threads"]) < PATTERN_MIN_SUPPORT:
+            continue
+        _add(f"pat_fail_{_slug(term)}", "failure",
+             f"recurring failure mode: '{term}'",
+             len(g["threads"]), sorted(g["evidence"]),
+             [f"'{term}' recurs as a failure — add a guard / check earlier"])
+
+    # (3) success paths: a successful run's step leading-term sequence recurring across threads
+    success = {tid for tid, evs in by_thread.items()
+               if any(e["type"] == "loop_closed" for e in evs)}
+    succ_groups: dict = {}
+    for tid in success:
+        steps = [e for e in by_thread[tid] if e["type"] in SUCCESS_STEP_TYPES]
+        if len(steps) < 2:
+            continue
+        sig = tuple(_lead(s["body"]) for s in steps)
+        if not all(sig):
+            continue
+        g = succ_groups.setdefault(sig, {"threads": set(), "evidence": set()})
+        g["threads"].add(tid)
+        g["evidence"].update(s["event_id"] for s in steps)
+    for sig, g in sorted(succ_groups.items(), key=lambda kv: (-len(kv[1]["threads"]), kv[0])):
+        if len(g["threads"]) < PATTERN_MIN_SUPPORT:
+            continue
+        _add(f"pat_success_{_slug('-'.join(sig))}", "success",
+             "successful path: " + " → ".join(sig),
+             len(g["threads"]), sorted(g["evidence"]) + sorted(g["threads"]),
+             ["recurring successful execution path — promote to a procedure (§16)"])
+
+    # (4) bottlenecks: a high causal in-degree node inside a still-unresolved thread
+    unresolved_threads = {tid for tid, evs in by_thread.items()
+                          if any(e["unresolved"] for e in evs)}
+    seen_bottleneck: set = set()
+    for r in rows:
+        eid = r["event_id"]
+        if eid in seen_bottleneck or deps.get(eid, 0) < BOTTLENECK_MIN_DEPS:
+            continue
+        if r["thread_id"] not in unresolved_threads:
+            continue
+        seen_bottleneck.add(eid)
+        _add(f"pat_bottleneck_{_slug(eid)}", "bottleneck",
+             f"bottleneck: {(r['body'] or eid)[:60]}",
+             deps[eid], [eid],
+             [f"{deps[eid]} causal dependents and the thread is unresolved — unblock first"])
+
+    proposals = proposals[:PATTERN_MAX_NEW]
+
+    applied = []
+    if apply and proposals:
+        import runtime
+        for p in proposals:
+            runtime.append("pattern_detected", agent="memory", **p)
+            applied.append(p["pattern_id"])
+
+    if not quiet:
+        if not proposals:
+            print(f"  no new patterns (min support {PATTERN_MIN_SUPPORT} threads)")
+        elif apply:
+            print(f"  detected {len(applied)} pattern(s): {', '.join(applied)}")
+        else:
+            print(f"  dry-run: {len(proposals)} candidate pattern(s). "
+                  "Re-run with --apply to record them:")
+            for p in proposals:
+                print(f"    {p['pattern_id']}  ({p['kind']}, conf {p['confidence']}, "
+                      f"freq {p['frequency']})")
+    return {"proposals": proposals, "applied": applied}
+
+
 def consolidate(apply: bool = False, quiet: bool = False) -> dict:
     """T2 consolidation pipeline (§9, §10): the offline "sleep cycle" run in order —
     abstraction → procedure learning → stale-belief pruning → snapshot/compaction.
@@ -519,16 +679,19 @@ def consolidate(apply: bool = False, quiet: bool = False) -> dict:
     import cognition
     if not quiet:
         print("T2 consolidation pipeline" + (" (--apply)" if apply else " (dry-run)") + ":")
-        print(" [1/4] abstraction")
+        print(" [1/6] abstraction")
     a = abstract(apply=apply, quiet=quiet)
     if not quiet:
-        print(" [2/4] procedure learning")
+        print(" [2/6] procedure learning")
     l = learn(apply=apply, quiet=quiet)
     if not quiet:
-        print(" [3/4] stale-belief pruning")
+        print(" [3/6] pattern mining")
+    m = mine(apply=apply, quiet=quiet)
+    if not quiet:
+        print(" [4/6] stale-belief pruning")
     p = prune(apply=apply, quiet=quiet)
     if not quiet:
-        print(" [4/5] snapshot / compaction")
+        print(" [5/6] snapshot / compaction")
     s = cognition.snapshot(apply=apply)
     if not quiet:
         if apply:
@@ -539,14 +702,15 @@ def consolidate(apply: bool = False, quiet: bool = False) -> dict:
     # runs on apply as the offline pass that lets dormant ideas resurface next session.
     inc = None
     if not quiet:
-        print(" [5/5] incubation")
+        print(" [6/6] incubation")
     if apply:
         inc = cognition.incubate()
         if not quiet:
             print(f"   incubated {inc['incubated']} dormant node(s)")
     elif not quiet:
         print("   dry-run: incubation would refresh the subconscious channel")
-    return {"abstract": a, "learn": l, "prune": p, "snapshot": s, "incubate": inc}
+    return {"abstract": a, "learn": l, "mine": m, "prune": p,
+            "snapshot": s, "incubate": inc}
 
 
 # ─── compression: thread digests (§9; replaces session snapshots) ────────────
@@ -657,6 +821,8 @@ def main(argv):
         abstract(apply="--apply" in rest, quiet="--quiet" in rest); return 0
     if cmd == "learn":
         learn(apply="--apply" in rest, quiet="--quiet" in rest); return 0
+    if cmd == "mine":
+        mine(apply="--apply" in rest, quiet="--quiet" in rest); return 0
     if cmd == "prune":
         prune(apply="--apply" in rest, quiet="--quiet" in rest); return 0
     if cmd == "consolidate":

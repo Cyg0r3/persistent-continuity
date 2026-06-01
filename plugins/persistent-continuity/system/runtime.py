@@ -67,6 +67,8 @@ KNOWN_TYPES = {
     "snapshot", "concept_retired",
     # v4 Phase 7 branching/versioning: label a hypothetical line of cognition + fold it back
     "branch_open", "branch_merge",
+    # v4.1 Phase 8 pattern recognition: the curator records a recurring pattern it mined
+    "pattern_detected",
 }
 
 # v4 Phase 7 multi-agent arbitration (§10): the memory curator owns consolidation. These
@@ -77,6 +79,7 @@ CURATOR_AGENT = "memory"
 CURATOR_TYPES = {
     "concept_formed", "procedure_learned", "concept_retired",
     "assumption_invalidated", "loop_closed", "snapshot",
+    "pattern_detected",
 }
 
 

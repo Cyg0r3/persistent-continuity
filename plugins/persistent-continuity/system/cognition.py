@@ -37,6 +37,8 @@ Subcommands:
                                                (mainline cache untouched) and diff vs main
     python cognition.py audit                  Curator-arbitration audit: flag consolidation
                                                events emitted by a non-curator agent
+    python cognition.py patterns               List recognized patterns (v4.1 §13) with
+                                               confidence, frequency, and recommended actions
 
 Multi-agent (§9): attend/context/subgraph accept --agent <planner|coder|researcher|memory>
 and --threads <t1,t2> to compute a role-biased attention WINDOW over the one shared graph
@@ -90,10 +92,13 @@ EDGE_WEIGHT = {"causal": 1.0, "membership": 0.7, "thread_rel": 0.4,
                "concept": 0.6,        # v4 Phase 2: concept <-> evidence episode (semantic recall)
                "procedure": 0.6,      # v4 Phase 3: procedure <-> evidence episode (how-to recall)
                "resonance": 0.5,      # v4 Phase 6: concept <-> concept association (Hebbian)
+               "pattern": 0.55,       # v4.1 Phase 8: pattern <-> evidence (surfaces a repeat)
                "contradiction": 0.0}  # contradiction handled by inhibition, not spread
 CONCEPT_SEED = 0.55       # v4 Phase 2: in-scope concepts seed attention (scaled by salience)
 PROCEDURE_SEED = 0.6      # v4 Phase 3: a procedure seeds attention only when its trigger
                           # matches the current situation (scaled by outcome_score)
+PATTERN_SEED = 0.5        # v4.1 Phase 8: a recurring pattern seeds attention scaled by its
+                          # confidence, so an active context surfaces the pattern it repeats
 
 # ── v4 Phase 6 attention dynamics (ARCHITECTURE_V4.md §8) ────────────────────
 # (1) Resonance: concepts whose evidence co-occurs across >= MIN_COOC threads "wire
@@ -141,6 +146,7 @@ CURATOR_AGENT = "memory"
 CURATOR_TYPES = {
     "concept_formed", "procedure_learned", "concept_retired",
     "assumption_invalidated", "loop_closed", "snapshot",
+    "pattern_detected",
 }
 
 
@@ -270,11 +276,23 @@ CREATE TABLE vectors (event_id TEXT PRIMARY KEY, model TEXT, dim INTEGER, vec TE
 -- v4 Phase 6 attention dynamics: a separate "subconscious" activation channel written by
 -- the query-less incubation pass; folded back into the next attention seed (resurfacing).
 CREATE TABLE incubation (event_id TEXT PRIMARY KEY, lift REAL);
+-- v4.1 Phase 8 pattern recognition: recurring reasoning/failure/success/bottleneck patterns
+-- mined from the projected graph and recorded as curator `pattern_detected` truth. Patterns
+-- are first-class memory objects: each is also a node (layer='pattern') wired to its evidence
+-- by `pattern` edges, so an active context surfaces the pattern it is repeating. `recommended`
+-- is JSON (recommended_actions); `confidence`/`frequency` are reinforced by re-detection.
+CREATE TABLE patterns (
+    pattern_id TEXT PRIMARY KEY, kind TEXT, label TEXT,
+    confidence REAL DEFAULT 0.5, frequency INTEGER DEFAULT 1,
+    recommended TEXT, last_seen_t TEXT
+);
+CREATE TABLE pattern_evidence (pattern_id TEXT, ref_kind TEXT, ref_id TEXT);
 CREATE INDEX ix_mem_thread ON membership(thread_id);
 CREATE INDEX ix_edges_dst ON edges(dst);
 CREATE INDEX ix_edges_src ON edges(src);
 CREATE INDEX ix_cev_concept ON concept_evidence(concept_id);
 CREATE INDEX ix_pev_procedure ON procedure_evidence(procedure_id);
+CREATE INDEX ix_patev_pattern ON pattern_evidence(pattern_id);
 """
 
 # Bump when the cache SCHEMA or its projection logic changes so an older cognition.db
@@ -285,8 +303,10 @@ CREATE INDEX ix_pev_procedure ON procedure_evidence(procedure_id);
 # `nodes.cold` compaction flag, snapshot bookkeeping (meta.snapshot_seq), concept
 # retirement (`concept_retired`) and recency-recalibrated concept salience; Phase 6 added
 # `resonance` concept<->concept edges and the `incubation` activation channel; Phase 7
-# added branch-filtered projection (the default mainline build excludes unmerged branches).
-SCHEMA_VERSION = 7
+# added branch-filtered projection (the default mainline build excludes unmerged branches);
+# Phase 8 added the patterns/pattern_evidence tables, pattern nodes (layer='pattern') and the
+# `pattern` edge (recurring patterns as first-class memory objects).
+SCHEMA_VERSION = 8
 
 
 def _build_watermark(db_path: Path) -> int:
@@ -541,6 +561,8 @@ def _project(conn, events: list) -> dict:
     _build_concepts(conn, events)
     # v4 Phase 3: materialize procedural memory from procedure_learned events.
     _build_procedures(conn, events)
+    # v4.1 Phase 8: materialize recurring patterns from pattern_detected events.
+    _build_patterns(conn, events)
     # v4 Phase 6: Hebbian concept<->concept resonance edges (associative spreading).
     _build_resonance(conn)
     # v4 Phase 4: persist one embedding per node so retrieval is a stored-vector scan.
@@ -556,6 +578,7 @@ def _project(conn, events: list) -> dict:
         "edges": conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
         "concepts": conn.execute("SELECT COUNT(*) FROM concepts").fetchone()[0],
         "procedures": conn.execute("SELECT COUNT(*) FROM procedures").fetchone()[0],
+        "patterns": conn.execute("SELECT COUNT(*) FROM patterns").fetchone()[0],
         "vectors": conn.execute("SELECT COUNT(*) FROM vectors").fetchone()[0],
         "cold": n_cold,
     }
@@ -690,6 +713,81 @@ def _build_procedures(conn, events: list) -> None:
             conn.execute("INSERT INTO procedure_evidence VALUES (?,?)", (pid, eid))
             conn.execute("INSERT INTO edges VALUES (?,?,?,?)",
                          (pid, eid, "procedure", EDGE_WEIGHT["procedure"]))
+
+
+def _pattern_id_of(e: dict) -> str:
+    return e.get("pattern_id") or e.get("id") or ""
+
+
+def _ref_kind(ref: str) -> str:
+    """Classify a pattern-evidence reference by id convention (thread vs concept vs episode)."""
+    if ref.startswith("thr_"):
+        return "thread"
+    if ref.startswith("cpt_"):
+        return "concept"
+    if ref.startswith("prc_"):
+        return "procedure"
+    return "event"
+
+
+def _build_patterns(conn, events: list) -> None:
+    """Project `pattern_detected` events into the pattern layer (v4.1 Phase 8 §13).
+
+    Patterns are curator-emitted truth: each event names a pattern, its `kind`
+    (reasoning/failure/success/temporal/bottleneck/similarity), a label, a `confidence`
+    and `frequency`, the `recommended` actions, and the `evidence` it generalizes
+    (thread/event/concept ids). Replaying in order reinforces a pattern (a later
+    `pattern_detected` for the same id lifts confidence/frequency). Each pattern is ALSO
+    materialized as a graph node (type='pattern', layer='pattern') wired to its evidence by
+    `pattern` edges, so spreading activation flows context<->pattern and the pattern
+    *surfaces the recurrence a live context is repeating*. Truth stays in the log; absent
+    pattern_detected events ⇒ empty pattern memory (pre-Phase-8 behavior)."""
+    acc: dict = {}   # pattern_id -> {kind,label,confidence,frequency,recommended,evidence:list,last_t}
+    for e in events:
+        if e.get("type") != "pattern_detected":
+            continue
+        pid = _pattern_id_of(e)
+        if not pid:
+            continue
+        p = acc.setdefault(pid, {"kind": "", "label": "", "confidence": 0.0,
+                                 "frequency": 0, "recommended": [], "evidence": [],
+                                 "last_t": e.get("t")})
+        p["kind"] = e.get("kind") or p["kind"] or "reasoning"
+        p["label"] = e.get("label") or e.get("summary") or e.get("msg") or p["label"] or pid
+        if e.get("confidence") is not None:
+            p["confidence"] = float(e["confidence"])
+        freq = e.get("frequency")
+        p["frequency"] = int(freq) if freq is not None else p["frequency"] + 1
+        rec = _as_list(e.get("recommended"))
+        if rec:
+            p["recommended"] = [str(x) for x in rec]
+        for ev in _as_list(e.get("evidence")):
+            if ev not in p["evidence"]:
+                p["evidence"].append(ev)
+        p["last_t"] = e.get("t") or p["last_t"]
+    for pid, p in acc.items():
+        # confidence: explicit, else climbs with re-detection frequency (bounded).
+        conf = (p["confidence"] if p["confidence"]
+                else round(min(0.95, 0.5 + 0.1 * (p["frequency"] - 1)), 4))
+        conn.execute(
+            "INSERT OR REPLACE INTO patterns"
+            "(pattern_id,kind,label,confidence,frequency,recommended,last_seen_t)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (pid, p["kind"], p["label"], conf, p["frequency"],
+             json.dumps(p["recommended"]), p["last_t"]))
+        # pattern node so it participates in attention / working memory
+        conn.execute(
+            "INSERT OR REPLACE INTO nodes"
+            "(event_id,seq,t,type,layer,body,importance,unresolved,reinforced)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (pid, None, p["last_t"], "pattern", "pattern", p["label"], conf, 0, 0))
+        for ref in p["evidence"]:
+            conn.execute("INSERT INTO pattern_evidence VALUES (?,?,?)",
+                         (pid, _ref_kind(ref), ref))
+            # wire the pattern to its evidence so activation flows context<->pattern
+            # (harmless if the ref is not itself a node — spreading just won't propagate).
+            conn.execute("INSERT INTO edges VALUES (?,?,?,?)",
+                         (pid, ref, "pattern", EDGE_WEIGHT["pattern"]))
 
 
 def _build_resonance(conn) -> int:
@@ -868,6 +966,13 @@ def _seed(conn, query: str, agent: str = "", threads=None) -> dict:
     # time this worked: …". Scaled by outcome_score (v4 Phase 3 §5.2).
     for pid, score in _matched_procedures(conn, query).items():
         seed[pid] = max(seed.get(pid, 0.0), PROCEDURE_SEED * score)
+    # v4.1 Phase 8: recurring patterns seed attention scaled by confidence, so a live
+    # context surfaces the pattern it is repeating (and the pattern's recommended actions).
+    try:
+        for r in conn.execute("SELECT pattern_id, confidence FROM patterns"):
+            seed[r[0]] = max(seed.get(r[0], 0.0), PATTERN_SEED * (r[1] or 0.0))
+    except sqlite3.Error:
+        pass  # pre-Phase-8 cache without the patterns table; next build() adds it
     # role-biased seeding: lift nodes matching this agent's focus types. ADDITIVE
     # overlay (not max) so the role actually reweights the window above the shared
     # floors (active-thread 0.5, unresolved 0.9); spreading is still over the full graph.
@@ -1199,6 +1304,9 @@ def snapshot(apply: bool = False) -> dict:
         "procedures": [dict(r) for r in conn.execute(
             "SELECT procedure_id,label,trigger,outcome_score FROM procedures "
             "ORDER BY procedure_id")],
+        "patterns": [dict(r) for r in conn.execute(
+            "SELECT pattern_id,kind,label,confidence,frequency FROM patterns "
+            "ORDER BY pattern_id")],
         "threads": [dict(r) for r in conn.execute(
             "SELECT thread_id,title,status,n_events FROM threads ORDER BY thread_id")],
     }
@@ -1693,10 +1801,11 @@ def main(argv):
         s = build(force="--force" in rest, branch=br)
         verb = "up-to-date (skipped rebuild)" if s.get("skipped") else "built"
         vecs = f", {s['vectors']} vectors" if "vectors" in s else ""
+        pats = f", {s['patterns']} patterns" if s.get("patterns") else ""
         cold = f", {s['cold']} cold" if s.get("cold") else ""
         tag = "" if br == DEFAULT_BRANCH else f" [branch={br}]"
         print(f"Graph {verb} from {s['events']} events{tag}: {s['nodes']} nodes, "
-              f"{s['threads']} threads, {s['edges']} edges{vecs}{cold} -> "
+              f"{s['threads']} threads, {s['edges']} edges{vecs}{pats}{cold} -> "
               f"{COG_DB.relative_to(ROOT)}")
         return 0
 
@@ -1705,6 +1814,25 @@ def main(argv):
             base = "" if b["base"] == DEFAULT_BRANCH else f" (from {b['base']})"
             print(f"  [{b['status']:<7}] {b['branch']:<20} "
                   f"events={b['events']}{base}")
+        return 0
+
+    if cmd == "patterns":
+        if not COG_DB.exists():
+            build()
+        conn = sqlite3.connect(COG_DB); conn.row_factory = sqlite3.Row
+        rows = list(conn.execute(
+            "SELECT * FROM patterns ORDER BY confidence DESC, frequency DESC"))
+        conn.close()
+        if not rows:
+            print("no patterns yet — run: reflect.py mine --apply  (then build)")
+            return 0
+        print("recognized patterns (v4.1 §13) — confidence x frequency:")
+        for r in rows:
+            rec = ", ".join(json.loads(r["recommended"] or "[]"))
+            print(f"  [{r['confidence']:.2f} x{r['frequency']:<3}] ({r['kind']}) "
+                  f"{r['pattern_id']}  {r['label'][:70]}")
+            if rec:
+                print(f"          ↳ recommended: {rec[:90]}")
         return 0
 
     if cmd == "reconstruct":

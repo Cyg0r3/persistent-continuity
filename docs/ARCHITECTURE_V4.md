@@ -523,17 +523,26 @@ cognition**, then **scale-out**.
 > `tests/test_phase7_branching.py` (13 tests). *Outcome: hypothetical reconstruction and clean
 > multi-agent evolution — all from the one log that remains the only truth.*
 
-> **Phase 8 — Pattern recognition layer. ⏳ PLANNED.**
-> Promote *patterns* to first-class memory objects (§13). A T2 mining pass (`patterns.py mine`,
-> dry-run by default) reads the projected graph and the causal DAG and detects recurring reasoning
-> structures, repeated failure modes, successful execution paths, temporal correlations, loop
-> recurrence, and cross-thread/cross-project conceptual similarity, emitting `pattern_detected`
-> truth events (curator-owned). `cognition._build_patterns` projects them into a new `patterns`
-> table with `confidence`/`frequency`/`recommended_actions`; pattern nodes (`mem_class='pattern'`)
-> join the graph and spread like concepts so an active context *surfaces the pattern it is repeating*.
-> Pure stdlib: motif/sequence detection over the existing edge/membership tables; no new dependency.
-> Gated by a `meta.schema_version` bump. *Outcome: pattern-aware cognition — the system recognizes
-> what it is doing again.*
+> **Phase 8 — Pattern recognition layer. ✅ BUILT.**
+> Promoted *patterns* to first-class memory objects (§13), all over the one append-only log
+> (gated by `meta.schema_version=8` so pre-Phase-8 caches rebuild instead of skipping). A T2
+> mining pass (`reflect.py mine`, dry-run by default, `--apply` to write; also stage [3/6] of
+> `reflect.py consolidate`) reads the projected graph and runs four deterministic, stdlib
+> detectors: **reasoning** (a contiguous n-gram of cognitive event *types* recurring across
+> threads — a repeated reasoning structure), **failure** (a failure signal —
+> `assumption_invalidated`/`contradiction`/`error`/aging open loop — whose leading term recurs),
+> **success** (a thread reaching `loop_closed` whose step leading-term sequence recurs — a
+> reusable execution path, the §16 promotion hook), and **bottleneck** (a node with many causal
+> *dependents* inside a still-unresolved thread). Each detection emits a curator-owned
+> `pattern_detected` event (`agent="memory"`); mining is idempotent (existing pattern_ids are
+> skipped) and entropy-capped (`PATTERN_MAX_NEW`). `cognition._build_patterns` projects these into
+> the new `patterns`/`pattern_evidence` tables with `confidence`/`frequency`/`recommended`, and
+> materializes each pattern as a graph **node** (`type='pattern'`, `layer='pattern'`) wired to its
+> evidence by `pattern` edges (`EDGE_WEIGHT['pattern']`). Patterns then seed attention scaled by
+> confidence (`PATTERN_SEED`), so a live context *surfaces the pattern it is repeating* and its
+> recommended actions. CLI: `cognition patterns`. Absent `pattern_detected` events ⇒ empty pattern
+> layer (exactly pre-Phase-8 behavior). Covered by `tests/test_phase8_patterns.py`. *Outcome:
+> pattern-aware cognition — the system recognizes what it is doing again.*
 
 > **Phase 9 — Adaptive procedural learning. ⏳ PLANNED.**
 > Turn the static `procedures` table (Phase 3) into self-improving procedural cognition (§14). A new
@@ -607,34 +616,33 @@ episodic/semantic/procedural — derived from the projected graph, never hand-au
   contradiction, or an unclosed loop.
 - **successful execution paths** — chains that recurrently reach `loop_closed` / passing artifacts.
 - **temporal correlations** — event types that reliably co-occur or follow within a thread window.
-- **cognitive bottlenecks / workflow inefficiencies** — nodes with high causal in-degree that
-  repeatedly stall progress; loops that re-open after closing (`loop recurrence`).
+- **cognitive bottlenecks / workflow inefficiencies** — nodes with many causal *dependents*
+  (a prerequisite many events rely on) inside a still-unresolved thread; loops that re-open
+  after closing (`loop recurrence`).
 - **cross-project conceptual similarity** — concepts whose evidence spans projects/branches and
   cluster by resonance + vector similarity.
 
-**Storage (schema additions, gated by a `schema_version` bump):**
+**Storage (schema additions, `SCHEMA_VERSION` bumped 7→8 so older caches rebuild):**
 ```sql
-ALTER TABLE nodes ADD COLUMN mem_class ... ;   -- 'pattern' joins episodic/semantic/procedural
 CREATE TABLE patterns (
-    pattern_id   TEXT PRIMARY KEY,    -- pat_<slug>
-    kind         TEXT,                -- 'reasoning' | 'failure' | 'success' | 'temporal' | 'bottleneck' | 'similarity'
+    pattern_id   TEXT PRIMARY KEY,    -- pat_<kind>_<slug>
+    kind         TEXT,                -- 'reasoning' | 'failure' | 'success' | 'bottleneck' | 'temporal' | 'similarity'
     label        TEXT,
-    confidence   REAL DEFAULT 0.5,    -- support- and recency-weighted, in [0,1]
+    confidence   REAL DEFAULT 0.5,    -- support-weighted, in [0,1]
     frequency    INTEGER DEFAULT 1,   -- # of observed instances
-    last_seen_t  TEXT,
     recommended  TEXT,                -- JSON: recommended_actions
-    embedding_id INTEGER              -- nullable; FK into vectors
+    last_seen_t  TEXT
 );
 CREATE TABLE pattern_evidence (pattern_id TEXT, ref_kind TEXT, ref_id TEXT);  -- threads/events/concepts
 ```
-A `pattern_detected` truth event (curator-owned, `agent="memory"`) carries the conclusion;
+(The 'pattern' memory class is carried by the existing `nodes.layer` column — `layer='pattern'` —
+joining episodic/semantic/procedural, rather than a separate `mem_class` column.) A
+`pattern_detected` truth event (curator-owned, `agent="memory"`) carries the conclusion;
 `cognition._build_patterns` projects it. Each pattern is also a node, joined to its evidence by
 `pattern` edges (`EDGE_WEIGHT['pattern']`), so spreading activation **surfaces the pattern a live
-context is repeating** — e.g. activating a debugging thread lifts `pat_debugging-loop`. A
-**predictive pattern score** ranks which patterns are most likely active given the current working
-set (confidence × recency × activation overlap). Pure stdlib: motif and sequence detection run over
-the existing `edges`/`membership`/`causes` tables; vector similarity reuses the Phase-4 path and
-degrades to lexical when vectors are absent. Example object:
+context is repeating** — e.g. activating a debugging thread lifts `pat_fail_timeout`. Pure stdlib:
+motif and sequence detection run over the existing `nodes`/`edges`/`membership`/`causes` tables;
+no new dependency. Example object:
 ```json
 { "pattern_id": "pat_debugging-loop", "kind": "reasoning", "confidence": 0.91,
   "frequency": 14, "associated_threads": ["thr_…"], "recommended_actions": ["bisect before patching"] }
