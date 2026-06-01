@@ -420,9 +420,22 @@ cognition**, then **scale-out**.
 > before. Covered by `tests/test_phase2_semantic.py` (5 tests).
 > *Outcome: meaning persists after episodes cool.*
 
-> **Phase 3 — Procedural memory.**
-> Add `procedures`, the `procedure_learned` event, trigger-matched injection into working memory, and
-> the T2 procedure-learning pass. *Outcome: the system improves at how it works, not just what it knows.*
+> **Phase 3 — Procedural memory. ✅ BUILT.**
+> Added the `procedures`/`procedure_evidence` tables and the `procedure` edge to the graph schema
+> (gated by `meta.schema_version=3` so pre-Phase-3 caches rebuild instead of skipping), the
+> `procedure_learned` event (curator-emitted, agent="memory"), and the **T2 procedure-learning pass**
+> (`reflect.py learn`): a deterministic, stdlib-only distillation of recurring *successful* workflows —
+> it considers only threads that reached a `loop_closed`, signatures each by its ordered step terms
+> (command/artifact/api_call/decision), and learns a procedure for any signature recurring across
+> `PROC_MIN_SUPPORT` successful threads, drawing the `trigger` cue from those threads'
+> objective/open_loop/error bodies (dry-run by default, `--apply` to learn, idempotent).
+> `cognition._build_procedures` projects those events into procedural memory — each procedure is
+> also materialized as a graph node (`type='procedure'`, `layer='procedural'`) wired to its evidence
+> episodes. Unlike always-on concepts, a procedure is **trigger-gated**: it seeds attention and
+> surfaces in `WorkingMemory.procedures` + the rendered lens ("Procedures (applicable how-to)") only
+> when its trigger matches the current situation (intent query + live open loops). Procedure-free
+> brains render byte-for-byte as before. Covered by `tests/test_phase3_procedural.py` (7 tests).
+> *Outcome: the system improves at how it works, not just what it knows.*
 
 > **Phase 4 — Persistent hybrid retrieval.**
 > Persist embeddings in `vectors`; wire vector ANN into candidate generation (graceful fallback to
