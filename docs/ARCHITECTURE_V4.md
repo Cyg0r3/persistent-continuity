@@ -383,10 +383,15 @@ Each phase is independently shippable, preserves all invariants, and is backward
 (absent fields/tables ⇒ current behavior). Ordered by **bottleneck-relief first**, then **new
 cognition**, then **scale-out**.
 
-> **Phase 0 — Performance foundation (no new cognition, pure speedup).**
-> Fix the O(N²): persist a sequence counter in `meta` so `runtime.append` stops reading the whole log.
-> Add incremental build (watermark `meta.last_seq`; apply deltas) with a periodic full rebuild for
-> integrity. *Outcome: per-prompt upkeep goes from O(log) to O(new events).*
+> **Phase 0 — Performance foundation (no new cognition, pure speedup). ✅ BUILT.**
+> Fixed the O(N²): `runtime.append` now allocates `event_id`s from a persisted O(1) counter
+> (`runtime/seq`, self-healing if lost/stale) instead of re-reading the whole log on every write.
+> `cognition.build()` records a watermark (`meta.event_count`) and **skips** the rebuild when the log
+> hasn't grown — the graph is a pure function of the log, so an unchanged log means the existing
+> `cognition.db` is already correct. `build(force=True)` / `build --force` always rebuilds (integrity
+> fallback), and a pre-v4 cache without the `meta` table rebuilds automatically. Truth still rests on
+> the log; the caches only avoid redundant work. Covered by `tests/test_phase0_scaling.py` (7 tests).
+> *Outcome: per-prompt upkeep drops from O(log) reads to O(1) when idle, O(new events) when it grew.*
 
 > **Phase 1 — Working memory as a runtime object.**
 > Introduce `WorkingMemory`; make `workspace()` its `render()`. Incremental `mutate()` on append.

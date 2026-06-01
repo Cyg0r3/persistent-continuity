@@ -17,7 +17,8 @@ extraction (NOT session replay). Determinism is at the event layer: same events 
 intent seed => same subgraph.
 
 Subcommands:
-    python cognition.py build                 Rebuild the graph (cognition.db) from events
+    python cognition.py build [--force]       Build the graph (cognition.db) from events
+                                              (skips when up-to-date; --force always rebuilds)
     python cognition.py attend [query] [-n N]  Compute attention; show top active nodes/threads
     python cognition.py context [query] [--write]  Synthesize the dynamic workspace lens
     python cognition.py threads                List threads with state (active/dormant/merged)
@@ -196,16 +197,51 @@ CREATE TABLE thread_activation (
     agent TEXT DEFAULT '', thread_id TEXT, activation REAL, resurfaced INTEGER DEFAULT 0,
     PRIMARY KEY (agent, thread_id)
 );
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX ix_mem_thread ON membership(thread_id);
 CREATE INDEX ix_edges_dst ON edges(dst);
 CREATE INDEX ix_edges_src ON edges(src);
 """
 
 
-def build(db_path: Path = COG_DB) -> dict:
-    """Rebuild the cognitive graph from zero (drop-and-rebuild = pure projection)."""
+def _build_watermark(db_path: Path) -> int:
+    """Event count the current cognition.db was built from, or -1 if unknown/stale.
+
+    Returns -1 (forcing a rebuild) whenever the DB is missing or predates the v4
+    `meta` table, so an older cache never silently satisfies the watermark check."""
+    if not db_path.exists():
+        return -1
+    try:
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key='event_count'").fetchone()
+        conn.close()
+        return int(row[0]) if row else -1
+    except sqlite3.Error:
+        return -1
+
+
+def build(db_path: Path = COG_DB, force: bool = False) -> dict:
+    """Rebuild the cognitive graph from zero (drop-and-rebuild = pure projection).
+
+    v4 Phase 0 — watermark skip: the graph is a pure function of the event log, so if
+    the log hasn't grown since the last build the existing cognition.db is already a
+    correct projection and we skip the O(N) rebuild. `force=True` always rebuilds
+    (full-rebuild fallback for integrity / schema changes). Correctness still rests on
+    the log; the watermark only avoids redundant work."""
     events = read_events()
     RUNTIME.mkdir(parents=True, exist_ok=True)
+    if not force and _build_watermark(db_path) == len(events):
+        conn = sqlite3.connect(db_path)
+        summary = {
+            "events": len(events),
+            "nodes": conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0],
+            "threads": conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0],
+            "edges": conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
+            "skipped": True,
+        }
+        conn.close()
+        return summary
     if db_path.exists():
         db_path.unlink()
     conn = sqlite3.connect(db_path)
@@ -303,12 +339,16 @@ def build(db_path: Path = COG_DB) -> dict:
             (tid, th["title"], th["opened_t"], th["last_activity_t"],
              th["status"], th["merged_into"], th["n_events"]))
 
+    # watermark: record the event count this build is a projection of (v4 Phase 0)
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('event_count',?)",
+                 (str(len(events)),))
     conn.commit()
     summary = {
         "events": len(events),
         "nodes": conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0],
         "threads": len(threads),
         "edges": conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
+        "skipped": False,
     }
     conn.close()
     _export_threads(summary)
@@ -729,8 +769,9 @@ def main(argv):
         return 0
 
     if cmd == "build":
-        s = build()
-        print(f"Graph built from {s['events']} events: {s['nodes']} nodes, "
+        s = build(force="--force" in rest)
+        verb = "up-to-date (skipped rebuild)" if s.get("skipped") else "built"
+        print(f"Graph {verb} from {s['events']} events: {s['nodes']} nodes, "
               f"{s['threads']} threads, {s['edges']} edges -> "
               f"{COG_DB.relative_to(ROOT)}")
         return 0
