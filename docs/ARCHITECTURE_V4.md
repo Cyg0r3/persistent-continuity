@@ -410,7 +410,9 @@ cognition**, then **scale-out**.
 > (gated by a new `meta.schema_version` so pre-Phase-2 caches rebuild instead of skipping),
 > the `concept_formed` event (curator-emitted, agent="memory"), and the **T2 abstraction
 > pass** (`reflect.py abstract`): a deterministic, stdlib-only clustering of recurring
-> episodic terms into durable concepts (dry-run by default, `--apply` to form, idempotent).
+> episodic terms into durable concepts (dry-run by default, `--apply` to form, idempotent). A
+> specificity (IDF) gate drops corpus-saturating generic terms and ranks the rest by tf-idf, engaging
+> only once the corpus exceeds `ABSTRACT_IDF_MIN_DOCS` (below that, document frequency is uninformative).
 > `cognition._build_concepts` projects those events into semantic memory — each concept is
 > also materialized as a graph node (`type='concept'`, `layer='semantic'`) wired to its
 > evidence episodes, so concepts **seed attention** (scaled by salience) and surface in

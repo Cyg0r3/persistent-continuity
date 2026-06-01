@@ -39,6 +39,7 @@ Pure stdlib. Reuses cognition.build (graph) and runtime.append (truth log).
 
 import re
 import sys
+import math
 import json
 import sqlite3
 from pathlib import Path
@@ -216,6 +217,14 @@ def resolve(apply: bool = False, quiet: bool = False) -> dict:
 ABSTRACT_MIN_SUPPORT = 3   # a term must recur across >= this many distinct episodes
                            # to be abstracted into a durable concept
 ABSTRACT_MAX_NEW = 12      # cap concepts formed per pass (entropy bound, §9)
+# Specificity gate (IDF). A term in almost every episode is generic noise ("fix",
+# "update"), not a concept — drop it. But document frequency is only informative once
+# the corpus is large enough, so the gate engages only at >= ABSTRACT_IDF_MIN_DOCS
+# episodes; below that we fall back to support-only (a distinctive term legitimately
+# appears in all of a handful of episodes). Candidates are then ranked by tf-idf so the
+# MAX_NEW cap keeps the most distinctive concepts.
+ABSTRACT_IDF_MIN_DOCS = 8
+ABSTRACT_MAX_DF_RATIO = 0.6
 # episodic/cognitive node types that carry abstractable meaning (skip pure plumbing)
 ABSTRACT_TYPES = {"objective", "decision", "observation", "hypothesis",
                   "assumption", "error", "artifact", "reflection"}
@@ -243,10 +252,12 @@ def abstract(apply: bool = False, quiet: bool = False) -> dict:
 
     Deterministic, stdlib-only (no embeddings required): a term recurring across
     >= ABSTRACT_MIN_SUPPORT distinct episodes becomes a candidate concept, with those
-    episodes as evidence. Idempotent — concepts already in the graph are skipped (a
-    re-run forms only genuinely new abstractions). Dry-run by default; --apply emits
-    `concept_formed` (agent="memory" — the curator owns semantic memory, §9). Append-only,
-    so it never edits truth; `cognition._build_concepts` projects it into semantic memory."""
+    episodes as evidence. A specificity (IDF) gate drops generic terms that saturate the
+    corpus and ranks the rest by tf-idf so the most distinctive concepts win the MAX_NEW
+    cap. Idempotent — concepts already in the graph are skipped (a re-run forms only
+    genuinely new abstractions). Dry-run by default; --apply emits `concept_formed`
+    (agent="memory" — the curator owns semantic memory, §9). Append-only, so it never
+    edits truth; `cognition._build_concepts` projects it into semantic memory."""
     conn = _graph()
     existing = {r["concept_id"] for r in conn.execute("SELECT concept_id FROM concepts")}
     rows = [dict(r) for r in conn.execute(
@@ -260,12 +271,29 @@ def abstract(apply: bool = False, quiet: bool = False) -> dict:
         for term in _terms(r["body"]):
             df.setdefault(term, set()).add(r["event_id"])
 
-    candidates = sorted(
-        ((t, ev) for t, ev in df.items() if len(ev) >= ABSTRACT_MIN_SUPPORT),
-        key=lambda kv: (-len(kv[1]), kv[0]))
+    n_docs = len(rows)
+    idf_reliable = n_docs >= ABSTRACT_IDF_MIN_DOCS
+
+    # Score = support * idf (specificity). The hard ratio gate removes saturating-generic
+    # terms outright; idf ranking demotes the merely-common. Both engage only once the
+    # corpus is large enough for document frequency to mean anything.
+    scored = []
+    for term, ev in df.items():
+        support = len(ev)
+        if support < ABSTRACT_MIN_SUPPORT:
+            continue
+        if idf_reliable:
+            if support / n_docs > ABSTRACT_MAX_DF_RATIO:
+                continue  # generic noise: in most episodes, distinguishes nothing
+            score = support * math.log(n_docs / support)
+        else:
+            score = float(support)  # tiny corpus: IDF degenerate, rank by support
+        scored.append((term, ev, score))
+
+    candidates = sorted(scored, key=lambda c: (-c[2], c[0]))
 
     proposals = []
-    for term, ev in candidates:
+    for term, ev, _score in candidates:
         cid = f"cpt_{_slug(term)}"
         if cid in existing:
             continue

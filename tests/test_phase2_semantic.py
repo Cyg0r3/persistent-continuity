@@ -109,6 +109,29 @@ class Phase2Semantic(unittest.TestCase):
         ctx = run(COGNITION, "context", home=self.home)
         self.assertNotIn("Concepts in scope", ctx)
 
+    def test_idf_gate_drops_generic_terms(self):
+        # A larger corpus (N >= 8) where a generic term saturates every episode while
+        # distinctive terms cluster in subsets: the specificity gate must drop the
+        # generic one and keep the distinctive ones.
+        home = Path(self.tmp.name) / "idf"
+        append(home, "session_start", session="s2", project="idf")
+        bodies = [
+            "update file sqlite cache layer", "update file sqlite cache index",
+            "update file sqlite cache vacuum", "update file token expiry bug",
+            "update file token refresh flow", "update file token rotation",
+            "update file logging format", "update file retry backoff",
+            "update file readme wording", "update file misc cleanup",
+        ]
+        for b in bodies:
+            append(home, "decision", msg=b)
+        run(COGNITION, "build", "--force", home=home)
+        out = run(REFLECT, "abstract", home=home)
+        self.assertNotIn("cpt_update", out)   # in all 10 episodes -> generic, dropped
+        self.assertNotIn("cpt_file", out)
+        self.assertIn("cpt_sqlite", out)      # distinctive subset -> kept
+        self.assertIn("cpt_cache", out)
+        self.assertIn("cpt_token", out)
+
     def test_pre_phase2_cache_rebuilds(self):
         # simulate an older cache: present but without schema_version → must NOT skip
         conn = db(self.home)
