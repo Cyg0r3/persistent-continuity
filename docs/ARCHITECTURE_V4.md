@@ -544,16 +544,23 @@ cognition**, then **scale-out**.
 > layer (exactly pre-Phase-8 behavior). Covered by `tests/test_phase8_patterns.py`. *Outcome:
 > pattern-aware cognition — the system recognizes what it is doing again.*
 
-> **Phase 9 — Adaptive procedural learning. ⏳ PLANNED.**
-> Turn the static `procedures` table (Phase 3) into self-improving procedural cognition (§14). A new
-> `proc_executed` event records each time a procedure is reused with its `outcome` (success/failure);
-> `cognition._build_procedures` folds these into a reinforcement-weighted `outcome_score` (effective
-> strategies strengthen, failed ones decay), tracks `uses`/`last_used_t`, and lets consolidation
-> *synthesize* and *generalize* procedures (abstracting a family of successful chains into one
-> heuristic) and retire chronically-failing ones (`procedure_retired`). Retrieval prefers
-> high-scoring, context-matched procedures. Append-only and replayable: the score is a deterministic
-> projection of the execution log. *Outcome: the workflows that consistently succeed get stronger;
-> the ones that fail fade.*
+> **Phase 9 — Adaptive procedural learning. ✅ BUILT.**
+> Turns the static `procedures` table (Phase 3) into self-improving procedural cognition (§14). The
+> new episodic truth event `proc_executed` `{procedure_id, outcome: success|failure, thread_id, t}`
+> records each reuse — *anyone* may emit it (NOT curator-owned), the score it feeds is a curator
+> projection. `cognition._build_procedures` folds executions chronologically into a
+> reinforcement-weighted `outcome_score` via a bounded delta-rule
+> (`score += PROC_LEARN_RATE * (target − score)`, target 1.0 success / 0.0 failure, `PROC_LEARN_RATE
+> = 0.25`, clamped [0,1]) so effective strategies strengthen and failing ones decay with recency;
+> each execution also counts as a use and advances `last_used_t` (the Phase 3 `uses ≥ 1` invariant
+> holds). Consolidation gains a `reflect.py retire-procedures` pass (T2 stage [5/7]) that emits a
+> curator `procedure_retired` for any procedure whose `outcome_score` fell below `PROC_RETIRE_SCORE`
+> (0.25) after at least `PROC_RETIRE_MIN_USES` (3) executions; the curator-owned `procedure_retired`
+> drops it from the projection and a later `procedure_learned` revives it. Retrieval already prefers
+> high-scoring, context-matched procedures (`PROCEDURE_SEED · outcome_score`). SCHEMA_VERSION 8→9,
+> append-only and replayable: the score is a deterministic projection of the execution log. Tests:
+> `tests/test_phase9_adaptive_procedures.py`. *Outcome: the workflows that consistently succeed get
+> stronger; the ones that fail fade.*
 
 > **Phase 10 — Meta-cognition layer. ⏳ PLANNED.**
 > A lightweight self-evaluation pass (§15): `reflect.py introspect` measures retrieval effectiveness,

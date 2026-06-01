@@ -99,6 +99,8 @@ PROCEDURE_SEED = 0.6      # v4 Phase 3: a procedure seeds attention only when it
                           # matches the current situation (scaled by outcome_score)
 PATTERN_SEED = 0.5        # v4.1 Phase 8: a recurring pattern seeds attention scaled by its
                           # confidence, so an active context surfaces the pattern it repeats
+PROC_LEARN_RATE = 0.25    # v4.1 Phase 9: reinforcement step — each proc_executed nudges
+                          # outcome_score toward 1.0 (success) or 0.0 (failure); recency-weighted
 
 # ── v4 Phase 6 attention dynamics (ARCHITECTURE_V4.md §8) ────────────────────
 # (1) Resonance: concepts whose evidence co-occurs across >= MIN_COOC threads "wire
@@ -146,7 +148,7 @@ CURATOR_AGENT = "memory"
 CURATOR_TYPES = {
     "concept_formed", "procedure_learned", "concept_retired",
     "assumption_invalidated", "loop_closed", "snapshot",
-    "pattern_detected",
+    "pattern_detected", "procedure_retired",
 }
 
 
@@ -306,7 +308,7 @@ CREATE INDEX ix_patev_pattern ON pattern_evidence(pattern_id);
 # added branch-filtered projection (the default mainline build excludes unmerged branches);
 # Phase 8 added the patterns/pattern_evidence tables, pattern nodes (layer='pattern') and the
 # `pattern` edge (recurring patterns as first-class memory objects).
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def _build_watermark(db_path: Path) -> int:
@@ -668,14 +670,43 @@ def _build_procedures(conn, events: list) -> None:
     wired to its evidence by `procedure` edges, so spreading activation flows
     episode<->how-to and the procedure can seed/surface in working memory once its trigger
     matches. Truth stays in the log; absent procedure_learned events ⇒ empty procedural
-    memory (current behavior)."""
+    memory (current behavior).
+
+    v4.1 Phase 9 (§14): the procedure is self-improving. `proc_executed` events (episodic
+    truth, anyone may emit) are folded chronologically into `outcome_score` by a bounded
+    reinforcement delta-rule (`score += PROC_LEARN_RATE * (target - score)`, target 1.0 for
+    success / 0.0 for failure), so consistently-succeeding workflows strengthen and failing
+    ones decay with recency. Each execution also counts as a use and advances last_used_t. A
+    curator `procedure_retired` event withdraws a chronically-failing procedure (skip
+    materialization); a later `procedure_learned` revives it. The score is a pure
+    deterministic replay of the execution log — no hidden state."""
     acc: dict = {}   # procedure_id -> {label, steps:list, trigger:list, score, uses, evidence:set, last_t}
+    retired: set = set()
     for e in events:
-        if e.get("type") != "procedure_learned":
+        et = e.get("type")
+        if et == "procedure_retired":
+            pid = _procedure_id_of(e)
+            if pid:
+                retired.add(pid)
+            continue
+        if et == "proc_executed":
+            pid = _procedure_id_of(e)
+            if not pid or pid not in acc:
+                continue                      # execution of an unknown/unlearned procedure: ignore
+            p = acc[pid]
+            outcome = str(e.get("outcome", "success")).lower()
+            target = 1.0 if outcome not in ("failure", "fail", "error", "0") else 0.0
+            base = p["score"] if p["score"] is not None else 0.5
+            p["score"] = max(0.0, min(1.0, base + PROC_LEARN_RATE * (target - base)))
+            p["uses"] += 1
+            p["last_t"] = e.get("t") or p["last_t"]
+            continue
+        if et != "procedure_learned":
             continue
         pid = _procedure_id_of(e)
         if not pid:
             continue
+        retired.discard(pid)                  # re-learning revives a previously retired procedure
         ev = _as_list(e.get("evidence"))
         p = acc.setdefault(pid, {"label": "", "steps": [], "trigger": [], "score": None,
                                  "uses": 0, "evidence": set(), "last_t": e.get("t")})
@@ -694,7 +725,9 @@ def _build_procedures(conn, events: list) -> None:
         if e.get("outcome_score") is not None:
             p["score"] = float(e["outcome_score"])
     for pid, p in acc.items():
-        # outcome_score: explicit, else a confidence that climbs with reinforcement uses.
+        if pid in retired:
+            continue                          # chronically-failing procedure withdrawn by curator
+        # outcome_score: explicit/reinforced, else a confidence that climbs with learn uses.
         score = p["score"] if p["score"] is not None else round(min(0.9, 0.5 + 0.1 * (p["uses"] - 1)), 4)
         conn.execute(
             "INSERT OR REPLACE INTO procedures"

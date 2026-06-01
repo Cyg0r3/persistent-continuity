@@ -69,6 +69,9 @@ KNOWN_TYPES = {
     "branch_open", "branch_merge",
     # v4.1 Phase 8 pattern recognition: the curator records a recurring pattern it mined
     "pattern_detected",
+    # v4.1 Phase 9 adaptive procedural learning: episodic execution outcome (anyone may emit);
+    # the curator retires a chronically-failing procedure
+    "proc_executed", "procedure_retired",
 }
 
 # v4 Phase 7 multi-agent arbitration (§10): the memory curator owns consolidation. These
@@ -80,6 +83,8 @@ CURATOR_TYPES = {
     "concept_formed", "procedure_learned", "concept_retired",
     "assumption_invalidated", "loop_closed", "snapshot",
     "pattern_detected",
+    # v4.1 Phase 9: retiring a procedure is a curator conclusion (proc_executed is NOT — anyone executes)
+    "procedure_retired",
 }
 
 

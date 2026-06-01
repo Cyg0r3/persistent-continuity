@@ -38,8 +38,10 @@ Subcommands:
                                            success/bottleneck) as first-class memory (§13)
     python reflect.py prune [--apply]      T2: retire stale concepts whose evidence went cold
                                            (semantic memory; dry-run unless --apply)
+    python reflect.py retire-procedures [--apply]  T2: retire chronically-failing procedures by
+                                           reinforced outcome_score (procedural memory; §14)
     python reflect.py consolidate [--apply]  T2 pipeline: abstract + learn + mine + prune +
-                                           snapshot (the offline "sleep cycle"; dry-run unless --apply)
+                                           retire-procedures + snapshot (the "sleep cycle"; dry-run unless --apply)
     python reflect.py all                  reflect + compress
 
 Pure stdlib. Reuses cognition.build (graph) and runtime.append (truth log).
@@ -225,6 +227,11 @@ def resolve(apply: bool = False, quiet: bool = False) -> dict:
 ABSTRACT_MIN_SUPPORT = 3   # a term must recur across >= this many distinct episodes
                            # to be abstracted into a durable concept
 ABSTRACT_MAX_NEW = 12      # cap concepts formed per pass (entropy bound, §9)
+# v4.1 Phase 9 (§14): retire a procedure whose reinforced outcome_score has decayed below
+# RETIRE_SCORE after at least RETIRE_MIN_USES recorded executions (enough evidence to judge).
+PROC_RETIRE_SCORE = 0.25
+PROC_RETIRE_MIN_USES = 3
+PROC_RETIRE_MAX = 10       # cap retirements per pass (entropy bound, §9)
 # Specificity gate (IDF). A term in almost every episode is generic noise ("fix",
 # "update"), not a concept — drop it. But document frequency is only informative once
 # the corpus is large enough, so the gate engages only at >= ABSTRACT_IDF_MIN_DOCS
@@ -510,6 +517,55 @@ def prune(apply: bool = False, quiet: bool = False) -> dict:
     return {"proposals": proposals, "applied": applied}
 
 
+def retire_procedures(apply: bool = False, quiet: bool = False) -> dict:
+    """T2 adaptive-procedure retirement (§14, Phase 9): withdraw a procedure whose
+    reinforcement-weighted `outcome_score` has decayed below PROC_RETIRE_SCORE after enough
+    recorded executions (>= PROC_RETIRE_MIN_USES) — i.e. a workflow that has *consistently
+    failed* in practice and should no longer be retrieved as "how-to".
+
+    Emits `procedure_retired` (agent='memory' — the curator owns procedural memory);
+    `cognition._build_procedures` then drops it from the projection (a later
+    `procedure_learned` revives it). Dry-run by default; append-only; idempotent (a retired
+    procedure is no longer materialized, so it is never re-proposed)."""
+    conn = _graph()
+    try:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT procedure_id, label, outcome_score, uses FROM procedures")]
+    except Exception:
+        rows = []   # pre-Phase-3 cache: no procedures table
+    conn.close()
+    proposals = []
+    for r in rows:
+        score = r["outcome_score"] if r["outcome_score"] is not None else 0.5
+        uses = r["uses"] or 0
+        if uses >= PROC_RETIRE_MIN_USES and score < PROC_RETIRE_SCORE:
+            proposals.append({
+                "procedure_id": r["procedure_id"],
+                "reason": f"chronic failure: outcome_score {round(score, 3)} after {uses} executions",
+            })
+        if len(proposals) >= PROC_RETIRE_MAX:
+            break
+
+    applied = []
+    if apply and proposals:
+        import runtime
+        for p in proposals:
+            runtime.append("procedure_retired", agent="memory", **p)
+            applied.append(p["procedure_id"])
+
+    if not quiet:
+        if not proposals:
+            print("  no chronically-failing procedures to retire")
+        elif apply:
+            print(f"  retired {len(applied)} procedure(s): {', '.join(applied)}")
+        else:
+            print(f"  dry-run: {len(proposals)} failing procedure(s). "
+                  "Re-run with --apply to retire:")
+            for p in proposals:
+                print(f"    {p['procedure_id']}  ({p['reason']})")
+    return {"proposals": proposals, "applied": applied}
+
+
 # ─── T2 pattern recognition (§13): recurring patterns as first-class memory ──────
 
 PATTERN_MIN_SUPPORT = 2    # a pattern must recur across >= this many distinct threads
@@ -688,10 +744,13 @@ def consolidate(apply: bool = False, quiet: bool = False) -> dict:
         print(" [3/6] pattern mining")
     m = mine(apply=apply, quiet=quiet)
     if not quiet:
-        print(" [4/6] stale-belief pruning")
+        print(" [4/7] stale-belief pruning")
     p = prune(apply=apply, quiet=quiet)
     if not quiet:
-        print(" [5/6] snapshot / compaction")
+        print(" [5/7] procedure retirement")
+    rp = retire_procedures(apply=apply, quiet=quiet)
+    if not quiet:
+        print(" [6/7] snapshot / compaction")
     s = cognition.snapshot(apply=apply)
     if not quiet:
         if apply:
@@ -702,7 +761,7 @@ def consolidate(apply: bool = False, quiet: bool = False) -> dict:
     # runs on apply as the offline pass that lets dormant ideas resurface next session.
     inc = None
     if not quiet:
-        print(" [6/6] incubation")
+        print(" [7/7] incubation")
     if apply:
         inc = cognition.incubate()
         if not quiet:
@@ -710,7 +769,7 @@ def consolidate(apply: bool = False, quiet: bool = False) -> dict:
     elif not quiet:
         print("   dry-run: incubation would refresh the subconscious channel")
     return {"abstract": a, "learn": l, "mine": m, "prune": p,
-            "snapshot": s, "incubate": inc}
+            "retire_procedures": rp, "snapshot": s, "incubate": inc}
 
 
 # ─── compression: thread digests (§9; replaces session snapshots) ────────────
@@ -825,6 +884,8 @@ def main(argv):
         mine(apply="--apply" in rest, quiet="--quiet" in rest); return 0
     if cmd == "prune":
         prune(apply="--apply" in rest, quiet="--quiet" in rest); return 0
+    if cmd == "retire-procedures":
+        retire_procedures(apply="--apply" in rest, quiet="--quiet" in rest); return 0
     if cmd == "consolidate":
         consolidate(apply="--apply" in rest, quiet="--quiet" in rest); return 0
     if cmd == "digest":
