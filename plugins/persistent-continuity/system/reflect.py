@@ -30,12 +30,16 @@ Subcommands:
     python reflect.py digest <thread_id>   Print a single thread's digest to stdout
     python reflect.py resolve [--apply]    memory-agent: resolve decisive contradictions
                                            (dry-run unless --apply)
+    python reflect.py abstract [--apply]   T2: form concepts from recurring episodes
+                                           (semantic memory; dry-run unless --apply)
     python reflect.py all                  reflect + compress
 
 Pure stdlib. Reuses cognition.build (graph) and runtime.append (truth log).
 """
 
+import re
 import sys
+import math
 import json
 import sqlite3
 from pathlib import Path
@@ -208,6 +212,120 @@ def resolve(apply: bool = False, quiet: bool = False) -> dict:
             "undecided": undecided}
 
 
+# ─── T2 consolidation: abstraction / concept formation (§9, §5.1) ────────────
+
+ABSTRACT_MIN_SUPPORT = 3   # a term must recur across >= this many distinct episodes
+                           # to be abstracted into a durable concept
+ABSTRACT_MAX_NEW = 12      # cap concepts formed per pass (entropy bound, §9)
+# Specificity gate (IDF). A term in almost every episode is generic noise ("fix",
+# "update"), not a concept — drop it. But document frequency is only informative once
+# the corpus is large enough, so the gate engages only at >= ABSTRACT_IDF_MIN_DOCS
+# episodes; below that we fall back to support-only (a distinctive term legitimately
+# appears in all of a handful of episodes). Candidates are then ranked by tf-idf so the
+# MAX_NEW cap keeps the most distinctive concepts.
+ABSTRACT_IDF_MIN_DOCS = 8
+ABSTRACT_MAX_DF_RATIO = 0.6
+# episodic/cognitive node types that carry abstractable meaning (skip pure plumbing)
+ABSTRACT_TYPES = {"objective", "decision", "observation", "hypothesis",
+                  "assumption", "error", "artifact", "reflection"}
+_STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "from", "into", "have", "has",
+    "was", "are", "were", "will", "would", "should", "could", "than", "then",
+    "them", "they", "their", "what", "when", "where", "which", "while", "about",
+    "after", "before", "over", "under", "your", "you", "our", "but", "not",
+    "all", "any", "can", "out", "via", "use", "used", "using", "per", "its",
+}
+_WORD = re.compile(r"[a-z][a-z0-9_-]{2,}")
+
+
+def _terms(body: str) -> set:
+    """Significant lowercased terms in an episode body (stopword-filtered, len>=3)."""
+    return {w for w in _WORD.findall((body or "").lower()) if w not in _STOPWORDS}
+
+
+def _slug(term: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", term.lower()).strip("-")
+
+
+def abstract(apply: bool = False, quiet: bool = False) -> dict:
+    """T2 abstraction: cluster recurring episodic content into durable concepts (§5.1).
+
+    Deterministic, stdlib-only (no embeddings required): a term recurring across
+    >= ABSTRACT_MIN_SUPPORT distinct episodes becomes a candidate concept, with those
+    episodes as evidence. A specificity (IDF) gate drops generic terms that saturate the
+    corpus and ranks the rest by tf-idf so the most distinctive concepts win the MAX_NEW
+    cap. Idempotent — concepts already in the graph are skipped (a re-run forms only
+    genuinely new abstractions). Dry-run by default; --apply emits `concept_formed`
+    (agent="memory" — the curator owns semantic memory, §9). Append-only, so it never
+    edits truth; `cognition._build_concepts` projects it into semantic memory."""
+    conn = _graph()
+    existing = {r["concept_id"] for r in conn.execute("SELECT concept_id FROM concepts")}
+    rows = [dict(r) for r in conn.execute(
+        f"SELECT event_id, body, type FROM nodes WHERE type IN "
+        f"({','.join('?' * len(ABSTRACT_TYPES))})", list(ABSTRACT_TYPES))]
+    conn.close()
+
+    # document frequency: term -> set(event_id) it appears in
+    df: dict = {}
+    for r in rows:
+        for term in _terms(r["body"]):
+            df.setdefault(term, set()).add(r["event_id"])
+
+    n_docs = len(rows)
+    idf_reliable = n_docs >= ABSTRACT_IDF_MIN_DOCS
+
+    # Score = support * idf (specificity). The hard ratio gate removes saturating-generic
+    # terms outright; idf ranking demotes the merely-common. Both engage only once the
+    # corpus is large enough for document frequency to mean anything.
+    scored = []
+    for term, ev in df.items():
+        support = len(ev)
+        if support < ABSTRACT_MIN_SUPPORT:
+            continue
+        if idf_reliable:
+            if support / n_docs > ABSTRACT_MAX_DF_RATIO:
+                continue  # generic noise: in most episodes, distinguishes nothing
+            score = support * math.log(n_docs / support)
+        else:
+            score = float(support)  # tiny corpus: IDF degenerate, rank by support
+        scored.append((term, ev, score))
+
+    candidates = sorted(scored, key=lambda c: (-c[2], c[0]))
+
+    proposals = []
+    for term, ev, _score in candidates:
+        cid = f"cpt_{_slug(term)}"
+        if cid in existing:
+            continue
+        proposals.append({
+            "concept_id": cid,
+            "summary": f"{term} — recurring concept across {len(ev)} episodes",
+            "evidence": sorted(ev),
+            "support": len(ev),
+        })
+        if len(proposals) >= ABSTRACT_MAX_NEW:
+            break
+
+    applied = []
+    if apply and proposals:
+        import runtime
+        for p in proposals:
+            runtime.append("concept_formed", agent="memory", **p)
+            applied.append(p["concept_id"])
+
+    if not quiet:
+        if not proposals:
+            print(f"  no new concepts (min support {ABSTRACT_MIN_SUPPORT})")
+        elif apply:
+            print(f"  formed {len(applied)} concept(s): {', '.join(applied)}")
+        else:
+            print(f"  dry-run: {len(proposals)} candidate concept(s). "
+                  "Re-run with --apply to form them:")
+            for p in proposals:
+                print(f"    {p['concept_id']}  (support {p['support']})")
+    return {"proposals": proposals, "applied": applied}
+
+
 # ─── compression: thread digests (§9; replaces session snapshots) ────────────
 
 def _thread_digest(conn, tid: str) -> str:
@@ -312,6 +430,8 @@ def main(argv):
         compress(); return 0
     if cmd == "resolve":
         resolve(apply="--apply" in rest, quiet="--quiet" in rest); return 0
+    if cmd == "abstract":
+        abstract(apply="--apply" in rest, quiet="--quiet" in rest); return 0
     if cmd == "digest":
         if not rest:
             print("usage: reflect.py digest <thread_id>"); return 2

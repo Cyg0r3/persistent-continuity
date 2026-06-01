@@ -393,13 +393,32 @@ cognition**, then **scale-out**.
 > the log; the caches only avoid redundant work. Covered by `tests/test_phase0_scaling.py` (7 tests).
 > *Outcome: per-prompt upkeep drops from O(log) reads to O(1) when idle, O(new events) when it grew.*
 
-> **Phase 1 — Working memory as a runtime object.**
-> Introduce `WorkingMemory`; make `workspace()` its `render()`. Incremental `mutate()` on append.
+> **Phase 1 — Working memory as a runtime object. ✅ BUILT.**
+> Introduced `WorkingMemory` (`cognition.py`): an in-process attention lens with
+> `active`/`threads` focus, a char `budget`, and reserved `concepts`/`procedures` fields
+> (empty until Phases 2/3 ⇒ current behavior). `WorkingMemory.from_graph()` seeds it from
+> the active subgraph; `workspace()` is now the thin wrapper `from_graph(...).render()`,
+> so the projection is byte-for-byte unchanged. `mutate(event)` folds a freshly-appended
+> event into focus at peak activation **without** rebuilding the graph (a later
+> `build()`+`from_graph()` reconciles to the exact projection); `reprioritize()` re-ranks
+> by activation and drops the coldest nodes until `render()` fits the budget. Markdown is
+> demoted to export only. Covered by `tests/test_phase1_working_memory.py` (4 tests).
 > *Outcome: markdown is fully demoted to export; live reprioritization within budget.*
 
-> **Phase 2 — Semantic memory.**
-> Add `concepts`/`concept_evidence`, the `concept` edge, the `concept_formed` event, and the T2
-> abstraction pass. Concepts join attention seeding. *Outcome: meaning persists after episodes cool.*
+> **Phase 2 — Semantic memory. ✅ BUILT.**
+> Added the `concepts`/`concept_evidence` tables and the `concept` edge to the graph schema
+> (gated by a new `meta.schema_version` so pre-Phase-2 caches rebuild instead of skipping),
+> the `concept_formed` event (curator-emitted, agent="memory"), and the **T2 abstraction
+> pass** (`reflect.py abstract`): a deterministic, stdlib-only clustering of recurring
+> episodic terms into durable concepts (dry-run by default, `--apply` to form, idempotent). A
+> specificity (IDF) gate drops corpus-saturating generic terms and ranks the rest by tf-idf, engaging
+> only once the corpus exceeds `ABSTRACT_IDF_MIN_DOCS` (below that, document frequency is uninformative).
+> `cognition._build_concepts` projects those events into semantic memory — each concept is
+> also materialized as a graph node (`type='concept'`, `layer='semantic'`) wired to its
+> evidence episodes, so concepts **seed attention** (scaled by salience) and surface in
+> `WorkingMemory.concepts` + the rendered lens. Concept-free brains render byte-for-byte as
+> before. Covered by `tests/test_phase2_semantic.py` (5 tests).
+> *Outcome: meaning persists after episodes cool.*
 
 > **Phase 3 — Procedural memory.**
 > Add `procedures`, the `procedure_learned` event, trigger-matched injection into working memory, and

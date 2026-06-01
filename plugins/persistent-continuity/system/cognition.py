@@ -75,7 +75,9 @@ REINFORCE_CAP = 0.30   # ceiling on cumulative reinforcement (avoids runaway)
 REINFORCE_TOP_N = 3    # how many focus nodes get an `attended` event on reinforce
 
 EDGE_WEIGHT = {"causal": 1.0, "membership": 0.7, "thread_rel": 0.4,
+               "concept": 0.6,        # v4 Phase 2: concept <-> evidence episode (semantic recall)
                "contradiction": 0.0}  # contradiction handled by inhibition, not spread
+CONCEPT_SEED = 0.55       # v4 Phase 2: in-scope concepts seed attention (scaled by salience)
 
 # ── multi-agent attention windows (ARCHITECTURE_V3.md §9) ────────────────────
 # Each agent computes its OWN attention over the ONE shared graph: same engine,
@@ -198,21 +200,39 @@ CREATE TABLE thread_activation (
     PRIMARY KEY (agent, thread_id)
 );
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+-- v4 Phase 2 semantic memory: durable concepts + their evidence back to episodes.
+CREATE TABLE concepts (
+    concept_id TEXT PRIMARY KEY, summary TEXT, salience REAL,
+    support INTEGER DEFAULT 0, formed_t TEXT
+);
+CREATE TABLE concept_evidence (concept_id TEXT, event_id TEXT);
 CREATE INDEX ix_mem_thread ON membership(thread_id);
 CREATE INDEX ix_edges_dst ON edges(dst);
 CREATE INDEX ix_edges_src ON edges(src);
+CREATE INDEX ix_cev_concept ON concept_evidence(concept_id);
 """
+
+# Bump when the cache SCHEMA or its projection logic changes so an older cognition.db
+# never silently satisfies the watermark skip (forces one rebuild). Phase 2 added the
+# concepts/concept_evidence tables and the `concept` edge.
+SCHEMA_VERSION = 2
 
 
 def _build_watermark(db_path: Path) -> int:
     """Event count the current cognition.db was built from, or -1 if unknown/stale.
 
-    Returns -1 (forcing a rebuild) whenever the DB is missing or predates the v4
-    `meta` table, so an older cache never silently satisfies the watermark check."""
+    Returns -1 (forcing a rebuild) whenever the DB is missing, predates the v4
+    `meta` table, or was built under an older SCHEMA_VERSION, so an older cache never
+    silently satisfies the watermark check."""
     if not db_path.exists():
         return -1
     try:
         conn = sqlite3.connect(db_path)
+        ver = conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        if not ver or int(ver[0]) != SCHEMA_VERSION:
+            conn.close()
+            return -1
         row = conn.execute(
             "SELECT value FROM meta WHERE key='event_count'").fetchone()
         conn.close()
@@ -339,20 +359,74 @@ def build(db_path: Path = COG_DB, force: bool = False) -> dict:
             (tid, th["title"], th["opened_t"], th["last_activity_t"],
              th["status"], th["merged_into"], th["n_events"]))
 
-    # watermark: record the event count this build is a projection of (v4 Phase 0)
+    # v4 Phase 2: materialize semantic memory from concept_formed events (curator truth).
+    _build_concepts(conn, events)
+
+    # watermark: record the event count + schema version this build is a projection of.
     conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('event_count',?)",
                  (str(len(events)),))
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",
+                 (str(SCHEMA_VERSION),))
     conn.commit()
     summary = {
         "events": len(events),
         "nodes": conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0],
         "threads": len(threads),
         "edges": conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
+        "concepts": conn.execute("SELECT COUNT(*) FROM concepts").fetchone()[0],
         "skipped": False,
     }
     conn.close()
     _export_threads(summary)
     return summary
+
+
+def _concept_id_of(e: dict) -> str:
+    return e.get("concept_id") or e.get("id") or ""
+
+
+def _build_concepts(conn, events: list) -> None:
+    """Project `concept_formed` events into semantic memory (v4 Phase 2 §5.1).
+
+    Concepts are curator-emitted truth: each event names a concept, a one-line summary,
+    and the evidence episodes it abstracts. Replaying in order accumulates support and
+    evidence (a later `concept_formed` for the same id reinforces it). Each concept is
+    ALSO materialized as a graph node (type='concept', layer='semantic') wired to its
+    evidence by `concept` edges, so spreading activation flows episode<->meaning and the
+    concept can seed/surface in working memory. Truth stays in the log; this is a pure
+    projection — absent concept_formed events ⇒ empty semantic memory (current behavior)."""
+    acc: dict = {}   # concept_id -> {summary, salience, support, evidence:set, formed_t}
+    for e in events:
+        if e.get("type") != "concept_formed":
+            continue
+        cid = _concept_id_of(e)
+        if not cid:
+            continue
+        ev = _as_list(e.get("evidence"))
+        c = acc.setdefault(cid, {"summary": "", "salience": 0.0, "support": 0,
+                                 "evidence": set(), "formed_t": e.get("t")})
+        c["summary"] = e.get("summary") or e.get("msg") or c["summary"] or cid
+        c["evidence"].update(ev)
+        # support: explicit, else cumulative distinct evidence count; reinforces over time.
+        c["support"] = int(e.get("support", max(len(c["evidence"]), c["support"] + 1)))
+        if e.get("salience") is not None:
+            c["salience"] = float(e["salience"])
+    for cid, c in acc.items():
+        sal = c["salience"] or round(min(0.9, 0.4 + 0.1 * c["support"]), 4)
+        conn.execute(
+            "INSERT OR REPLACE INTO concepts(concept_id,summary,salience,support,formed_t)"
+            " VALUES (?,?,?,?,?)", (cid, c["summary"], sal, c["support"], c["formed_t"]))
+        # concept node so it participates in attention / working memory
+        conn.execute(
+            "INSERT OR REPLACE INTO nodes"
+            "(event_id,seq,t,type,layer,body,importance,unresolved,reinforced)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (cid, None, c["formed_t"], "concept", "semantic",
+             c["summary"], sal, 0, 0))
+        for eid in c["evidence"]:
+            conn.execute("INSERT INTO concept_evidence VALUES (?,?)", (cid, eid))
+            conn.execute("INSERT INTO edges VALUES (?,?,?,?)",
+                         (cid, eid, "concept", EDGE_WEIGHT["concept"]))
 
 
 def _new_thread(tid: str) -> dict:
@@ -404,6 +478,13 @@ def _seed(conn, query: str, agent: str = "", threads=None) -> dict:
         for r in conn.execute(
                 f"SELECT event_id FROM membership WHERE thread_id IN ({q})", active):
             seed[r[0]] = max(seed.get(r[0], 0.0), 0.5)
+    # in-scope semantic memory: concepts seed attention scaled by salience, so durable
+    # meaning resurfaces even when the originating episodes have cooled (v4 Phase 2 §5.1).
+    try:
+        for r in conn.execute("SELECT concept_id, salience FROM concepts"):
+            seed[r[0]] = max(seed.get(r[0], 0.0), CONCEPT_SEED * (r[1] or 0.0))
+    except sqlite3.Error:
+        pass  # pre-Phase-2 cache without the concepts table; next build() adds it
     # role-biased seeding: lift nodes matching this agent's focus types. ADDITIVE
     # overlay (not max) so the role actually reweights the window above the shared
     # floors (active-thread 0.5, unresolved 0.9); spreading is still over the full graph.
@@ -629,63 +710,171 @@ def active_subgraph(query: str = "", top_n: int = 8, agent: str = "", threads=No
             "contradictions": state["contradictions"], "core": core}
 
 
+# ─── Phase 1: working memory as a runtime object (ARCHITECTURE_V4.md §4.2) ───
+
+# Char budget for the rendered lens (~1,500-token guardrail). Mirrors runtime's
+# WORKING_CONTEXT_BUDGET_CHARS; markdown is export only, so this bounds the export.
+WORKING_MEMORY_BUDGET_CHARS = 6000
+
+
+class WorkingMemory:
+    """In-process attention lens over the active subgraph (L4).
+
+    V3 synthesized this lens fresh every prompt and treated working_context.md as the
+    artifact. V4 Phase 1 promotes it to a first-class runtime object: it is built once
+    from the graph, then `mutate()`d incrementally as new events land (no full
+    re-synthesis), `reprioritize()`d within a fixed budget, and `render()`ed to markdown
+    only for export/debug. `concepts`/`procedures` are reserved for Phases 2/3 and stay
+    empty here (absent ⇒ current behavior, per the backward-compat invariant)."""
+
+    def __init__(self, budget: int = WORKING_MEMORY_BUDGET_CHARS,
+                 query: str = "", agent: str = ""):
+        self.active: dict = {}        # event_id -> activation (current focus)
+        self.threads: dict = {}       # thread_id -> activation
+        self.concepts: list = []      # semantic context in scope  (Phase 2)
+        self.procedures: list = []    # applicable how-to knowledge (Phase 3)
+        self.budget = budget
+        self.query = query
+        self.agent = agent
+        # detail backing render(), keyed for O(1) incremental mutation
+        self._nodes: dict = {}        # event_id -> node detail row
+        self._th_meta: dict = {}      # thread_id -> threads-table row
+        self._concept_meta: dict = {} # concept_id -> concepts-table row
+        self._resurfaced: set = set()
+        self._contradictions: list = []
+
+    @classmethod
+    def from_graph(cls, query: str = "", top_n: int = 8, agent: str = "",
+                   threads=None, budget: int = WORKING_MEMORY_BUDGET_CHARS):
+        """Synthesize working memory from the current active subgraph (initial seed)."""
+        sg = active_subgraph(query, top_n, agent=agent, threads=threads)
+        wm = cls(budget=budget, query=query, agent=agent)
+        conn = sqlite3.connect(COG_DB)
+        conn.row_factory = sqlite3.Row
+        wm._th_meta = {r["thread_id"]: dict(r) for r in conn.execute("SELECT * FROM threads")}
+        wm._concept_meta = {r["concept_id"]: dict(r)
+                            for r in conn.execute("SELECT * FROM concepts")}
+        conn.close()
+        for n in sg["nodes"]:
+            wm._nodes[n["event_id"]] = n
+            wm.active[n["event_id"]] = n["activation"]
+            # in-scope semantic memory: active concept nodes feed WorkingMemory.concepts
+            if n["layer"] == "semantic" and n["event_id"] in wm._concept_meta:
+                wm.concepts.append(n["event_id"])
+        wm.threads = dict(sg["threads"])
+        wm._resurfaced = set(sg["resurfaced"])
+        wm._contradictions = list(sg["contradictions"])
+        return wm
+
+    def mutate(self, event: dict) -> "WorkingMemory":
+        """Fold one freshly-appended event into the lens WITHOUT rebuilding the graph.
+
+        The new event is the most-recent signal, so it enters focus at the current peak
+        activation (never below the existing top), and its threads are bumped likewise.
+        Truth still lives in the log; this only keeps the in-process lens warm between
+        builds. A subsequent build()+from_graph() reconciles to the exact projection."""
+        eid = event.get("event_id")
+        if not eid:
+            return self
+        peak = max(self.active.values(), default=0.0)
+        act = max(peak, 1.0)
+        self._nodes[eid] = {
+            "event_id": eid, "type": event.get("type", ""),
+            "layer": _layer(event), "body": _body(event),
+            "t": event.get("t", now_iso()), "activation": act,
+        }
+        self.active[eid] = act
+        for tid in _as_list(event.get("thread_ids")):
+            self.threads[tid] = max(self.threads.get(tid, 0.0), act)
+        return self
+
+    def reprioritize(self) -> "WorkingMemory":
+        """Re-rank focus by activation and drop the coldest nodes once render would
+        exceed budget. Attention-driven, budget-bounded — the lens stays small."""
+        ranked = sorted(self._nodes.values(), key=lambda n: n["activation"], reverse=True)
+        # Greedy keep highest-activation nodes until the rendered size hits budget.
+        while ranked and len(self._render(ranked)) > self.budget:
+            dropped = ranked.pop()
+            self.active.pop(dropped["event_id"], None)
+            self._nodes.pop(dropped["event_id"], None)
+        return self
+
+    def _ranked_nodes(self) -> list:
+        return sorted(self._nodes.values(), key=lambda n: n["activation"], reverse=True)
+
+    def _render(self, nodes: list) -> str:
+        threads_ranked = sorted(self.threads.items(), key=lambda kv: kv[1], reverse=True)
+        cognitive = [n for n in nodes if n["layer"] == "cognitive"]
+        loops = [n for n in cognitive if n["type"] == "open_loop"]
+        L = []
+        L.append(f"# Workspace @ {now_iso()} "
+                 f"(active subgraph: {len(nodes)} nodes / "
+                 f"{sum(1 for _, s in threads_ranked if s > 0)} threads)")
+        L.append("")
+        L.append("## Active threads")
+        shown = [(t, s) for t, s in threads_ranked if s > 0][:5]
+        if shown:
+            for i, (tid, sc) in enumerate(shown, 1):
+                meta = self._th_meta.get(tid)
+                title = (meta["title"] if meta else tid) or tid
+                flag = " ^resurfaced" if tid in self._resurfaced else ""
+                state = f" [{meta['status']}]" if meta else ""
+                L.append(f"{i}. [{sc:.2f}] {tid} - {title}{state}{flag}")
+        else:
+            L.append("(no threads yet - events are unthreaded)")
+        L.append("")
+        L.append("## Focus (highest activation)")
+        for n in cognitive[:5]:
+            L.append(f"- {n['type']} {n['event_id']}: {n['body'][:110]} [{n['activation']:.2f}]")
+        if not cognitive:
+            L.append("(no cognitive nodes active)")
+        L.append("")
+        # semantic memory in scope (v4 Phase 2). Section omitted when empty so the
+        # rendered lens is byte-for-byte unchanged for pre-concept brains.
+        active_concepts = [c for c in self.concepts if c in self._concept_meta]
+        if active_concepts:
+            ranked_c = sorted(active_concepts,
+                              key=lambda c: self.active.get(c, 0.0), reverse=True)[:5]
+            L.append("## Concepts in scope (semantic memory)")
+            for cid in ranked_c:
+                m = self._concept_meta[cid]
+                L.append(f"- {cid}: {(m['summary'] or '')[:90]} "
+                         f"(support {m['support']}, salience {m['salience']:.2f})")
+            L.append("")
+        if self._contradictions:
+            L.append("## Live tension (competing hypotheses)")
+            for a, b, sa, sb in self._contradictions:
+                lean = a if sa >= sb else b
+                L.append(f"- {a} vs {b} - leaning {lean} ({sa:.2f} vs {sb:.2f})")
+            L.append("")
+        L.append("## Next concrete action")
+        L.append(loops[0]["body"][:140] if loops else "(no open loops - define next objective)")
+        L.append("")
+        L.append("_Projection of the active subgraph; truth = runtime/events.jsonl_")
+        return "\n".join(L) + "\n"
+
+    def render(self) -> str:
+        """Export/debug → working_context.md text."""
+        return self._render(self._ranked_nodes())
+
+
 def workspace(query: str = "", top_n: int = 8, reinforce: bool = False,
               agent: str = "", threads=None) -> str:
     """Synthesize the ephemeral attention lens over the active subgraph (L4).
     This REPLACES stored working_context; writing it to disk is debug/export only.
 
+    V4 Phase 1: this is now a thin wrapper — `WorkingMemory.from_graph(...).render()`.
     reinforce=True emits an `attended` event for the top focus nodes (§5.3) so that
     what the workspace surfaces gains a replayable reinforcement floor next build.
     `agent`/`threads` select a role-biased window (§9); the reinforcement is tagged
     with the agent for provenance but its base-activation floor stays global (truth
     about the shared graph, not private to one window)."""
-    sg = active_subgraph(query, top_n, agent=agent, threads=threads)
-    conn = sqlite3.connect(COG_DB)
-    conn.row_factory = sqlite3.Row
-    th_meta = {r["thread_id"]: r for r in conn.execute("SELECT * FROM threads")}
-    conn.close()
-
-    threads_ranked = sorted(sg["threads"].items(), key=lambda kv: kv[1], reverse=True)
-    cognitive = [n for n in sg["nodes"] if n["layer"] == "cognitive"]
-    loops = [n for n in cognitive if n["type"] == "open_loop"]
-
-    if reinforce and cognitive:
-        _reinforce_attended([n["event_id"] for n in cognitive[:REINFORCE_TOP_N]], agent)
-
-    L = []
-    L.append(f"# Workspace @ {now_iso()} "
-             f"(active subgraph: {len(sg['nodes'])} nodes / "
-             f"{sum(1 for _, s in threads_ranked if s > 0)} threads)")
-    L.append("")
-    L.append("## Active threads")
-    shown = [(t, s) for t, s in threads_ranked if s > 0][:5]
-    if shown:
-        for i, (tid, sc) in enumerate(shown, 1):
-            meta = th_meta.get(tid)
-            title = (meta["title"] if meta else tid) or tid
-            flag = " ^resurfaced" if tid in sg["resurfaced"] else ""
-            state = f" [{meta['status']}]" if meta else ""
-            L.append(f"{i}. [{sc:.2f}] {tid} - {title}{state}{flag}")
-    else:
-        L.append("(no threads yet - events are unthreaded)")
-    L.append("")
-    L.append("## Focus (highest activation)")
-    for n in cognitive[:5]:
-        L.append(f"- {n['type']} {n['event_id']}: {n['body'][:110]} [{n['activation']:.2f}]")
-    if not cognitive:
-        L.append("(no cognitive nodes active)")
-    L.append("")
-    if sg["contradictions"]:
-        L.append("## Live tension (competing hypotheses)")
-        for a, b, sa, sb in sg["contradictions"]:
-            lean = a if sa >= sb else b
-            L.append(f"- {a} vs {b} - leaning {lean} ({sa:.2f} vs {sb:.2f})")
-        L.append("")
-    L.append("## Next concrete action")
-    L.append(loops[0]["body"][:140] if loops else "(no open loops - define next objective)")
-    L.append("")
-    L.append("_Projection of the active subgraph; truth = runtime/events.jsonl_")
-    return "\n".join(L) + "\n"
+    wm = WorkingMemory.from_graph(query, top_n, agent=agent, threads=threads)
+    if reinforce:
+        cognitive = [n for n in wm._ranked_nodes() if n["layer"] == "cognitive"]
+        if cognitive:
+            _reinforce_attended([n["event_id"] for n in cognitive[:REINFORCE_TOP_N]], agent)
+    return wm.render()
 
 
 def _reinforce_attended(event_ids: list, agent: str = "") -> None:

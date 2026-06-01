@@ -59,13 +59,15 @@ KNOWN_TYPES = {
     # v3 cognition-native additions (ARCHITECTURE_V3.md)
     "observation", "hypothesis", "contradiction", "output", "api_call",
     "command", "thread_open", "thread_merge", "thread_split", "attended",
+    # v4 Phase 2 semantic memory: the memory curator consolidates episodes into concepts
+    "concept_formed",
 }
 
 # v3: cognitive vs execution vs meta layer, inferred from type when not given (§4).
 COGNITIVE_TYPES = {
     "objective", "decision", "observation", "reflection", "hypothesis",
     "contradiction", "assumption", "assumption_invalidated", "open_loop",
-    "loop_closed", "topic_shift",
+    "loop_closed", "topic_shift", "concept_formed",
 }
 EXECUTION_TYPES = {"artifact", "output", "api_call", "error", "command"}
 
@@ -373,6 +375,13 @@ def checkpoint(reason: str = "manual", end_status: str = "paused",
 
     keep_open=True records the checkpoint marker WITHOUT ending the session —
     used by the PreCompact hook (context-pressure checkpoint mid-session)."""
+    # Uninitialized project (plugin enabled but /continuity-init not run): stay
+    # silent and DO NOT create .continuity/. The SessionEnd/PreCompact hooks call
+    # this on every project; without this guard append() would mkdir + seed a
+    # stray events.jsonl, littering projects that never opted in (mirrors restore()).
+    if not EVENTS.exists():
+        return {"event_count": 0, "status": "uninitialized", "project": None,
+                "open_loops": {}, "checkpoints": 0, "session": None}
     state = derive_state()
     append("checkpoint", reason=reason, session=state["session"])
     if state["session"] and not keep_open:
