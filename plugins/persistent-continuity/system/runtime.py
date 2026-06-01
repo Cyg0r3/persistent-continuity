@@ -63,6 +63,8 @@ KNOWN_TYPES = {
     "concept_formed",
     # v4 Phase 3 procedural memory: the curator distills successful workflows into procedures
     "procedure_learned",
+    # v4 Phase 5 consolidation: snapshot checkpoint + stale-concept retirement (curator-owned)
+    "snapshot", "concept_retired",
 }
 
 # v3: cognitive vs execution vs meta layer, inferred from type when not given (§4).
@@ -70,6 +72,7 @@ COGNITIVE_TYPES = {
     "objective", "decision", "observation", "reflection", "hypothesis",
     "contradiction", "assumption", "assumption_invalidated", "open_loop",
     "loop_closed", "topic_shift", "concept_formed", "procedure_learned",
+    "concept_retired",
 }
 EXECUTION_TYPES = {"artifact", "output", "api_call", "error", "command"}
 

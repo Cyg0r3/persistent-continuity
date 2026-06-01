@@ -34,6 +34,10 @@ Subcommands:
                                            (semantic memory; dry-run unless --apply)
     python reflect.py learn [--apply]      T2: learn procedures from recurring successful
                                            workflows (procedural memory; dry-run unless --apply)
+    python reflect.py prune [--apply]      T2: retire stale concepts whose evidence went cold
+                                           (semantic memory; dry-run unless --apply)
+    python reflect.py consolidate [--apply]  T2 pipeline: abstract + learn + prune + snapshot
+                                           (the offline "sleep cycle"; dry-run unless --apply)
     python reflect.py all                  reflect + compress
 
 Pure stdlib. Reuses cognition.build (graph) and runtime.append (truth log).
@@ -446,6 +450,94 @@ def learn(apply: bool = False, quiet: bool = False) -> dict:
     return {"proposals": proposals, "applied": applied}
 
 
+# ─── T2 consolidation: stale-belief pruning + pipeline (§9, §5.1) ────────────
+
+PRUNE_MAX = 8   # entropy cap: retire at most this many stale concepts per pass (§9)
+
+
+def prune(apply: bool = False, quiet: bool = False) -> dict:
+    """T2 stale-belief pruning (§9): retire concepts whose evidence has ALL gone cold
+    (compacted behind a snapshot) and which NO active thread still cites — meaning that did
+    not persist through recurrence and is now dead weight on the active graph.
+
+    Emits `concept_retired` (agent='memory' — the curator owns semantic memory);
+    `cognition._build_concepts` then drops the concept from the projection (a later
+    `concept_formed` would revive it). Dry-run by default; append-only, so it never edits
+    truth. Idempotent: a retired concept is no longer materialized, so it is never re-proposed."""
+    conn = _graph()
+    active_members = {r["event_id"] for r in conn.execute(
+        "SELECT m.event_id FROM membership m JOIN threads t ON m.thread_id=t.thread_id "
+        "WHERE t.status='active'")}
+    concepts = [dict(r) for r in conn.execute("SELECT concept_id FROM concepts")]
+    proposals = []
+    for c in concepts:
+        ev = [dict(r) for r in conn.execute(
+            "SELECT ce.event_id, COALESCE(n.cold,0) AS cold FROM concept_evidence ce "
+            "LEFT JOIN nodes n ON n.event_id=ce.event_id WHERE ce.concept_id=?",
+            (c["concept_id"],))]
+        if not ev:
+            continue   # no evidence in the graph yet — could be mid-formation; leave it
+        all_cold = all(r["cold"] for r in ev)
+        cited = any(r["event_id"] in active_members for r in ev)
+        if all_cold and not cited:
+            proposals.append({
+                "concept_id": c["concept_id"],
+                "reason": f"stale: all {len(ev)} evidence episodes cold, no active citation",
+            })
+        if len(proposals) >= PRUNE_MAX:
+            break
+    conn.close()
+
+    applied = []
+    if apply and proposals:
+        import runtime
+        for p in proposals:
+            runtime.append("concept_retired", agent="memory", **p)
+            applied.append(p["concept_id"])
+
+    if not quiet:
+        if not proposals:
+            print("  no stale concepts to retire")
+        elif apply:
+            print(f"  retired {len(applied)} concept(s): {', '.join(applied)}")
+        else:
+            print(f"  dry-run: {len(proposals)} stale concept(s). "
+                  "Re-run with --apply to retire:")
+            for p in proposals:
+                print(f"    {p['concept_id']}  ({p['reason']})")
+    return {"proposals": proposals, "applied": applied}
+
+
+def consolidate(apply: bool = False, quiet: bool = False) -> dict:
+    """T2 consolidation pipeline (§9, §10): the offline "sleep cycle" run in order —
+    abstraction → procedure learning → stale-belief pruning → snapshot/compaction.
+
+    Each stage is append-only and dry-run unless --apply, so this is the single entry point
+    for opportunistic (idle / N-events / PreCompact) consolidation that never blocks an
+    interactive turn. Pruning acts on episodes a PRIOR snapshot compacted, so the cycle
+    converges over successive runs (form/learn now; compact + prune what stays cold later)."""
+    import cognition
+    if not quiet:
+        print("T2 consolidation pipeline" + (" (--apply)" if apply else " (dry-run)") + ":")
+        print(" [1/4] abstraction")
+    a = abstract(apply=apply, quiet=quiet)
+    if not quiet:
+        print(" [2/4] procedure learning")
+    l = learn(apply=apply, quiet=quiet)
+    if not quiet:
+        print(" [3/4] stale-belief pruning")
+    p = prune(apply=apply, quiet=quiet)
+    if not quiet:
+        print(" [4/4] snapshot / compaction")
+    s = cognition.snapshot(apply=apply)
+    if not quiet:
+        if apply:
+            print(f"   snapshot at seq {s['snapshot_seq']} -> {s['written']}")
+        else:
+            print(f"   dry-run: snapshot would cover {s['snapshot_seq']} events")
+    return {"abstract": a, "learn": l, "prune": p, "snapshot": s}
+
+
 # ─── compression: thread digests (§9; replaces session snapshots) ────────────
 
 def _thread_digest(conn, tid: str) -> str:
@@ -554,6 +646,10 @@ def main(argv):
         abstract(apply="--apply" in rest, quiet="--quiet" in rest); return 0
     if cmd == "learn":
         learn(apply="--apply" in rest, quiet="--quiet" in rest); return 0
+    if cmd == "prune":
+        prune(apply="--apply" in rest, quiet="--quiet" in rest); return 0
+    if cmd == "consolidate":
+        consolidate(apply="--apply" in rest, quiet="--quiet" in rest); return 0
     if cmd == "digest":
         if not rest:
             print("usage: reflect.py digest <thread_id>"); return 2

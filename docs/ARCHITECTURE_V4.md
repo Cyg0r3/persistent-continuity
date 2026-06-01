@@ -453,9 +453,26 @@ cognition**, then **scale-out**.
 > `tests/test_phase4_hybrid.py` (8 tests). *Outcome: associative recall; vectors accelerate, graph
 > still decides.*
 
-> **Phase 5 — Consolidation pipeline + snapshots.**
-> Formalize T0/T1/T2 scheduling; add snapshot/compaction (`snapshot` event, `meta.snapshot_seq`),
-> pruning, salience recalibration, entropy caps. *Outcome: unlimited-timescale scaling.*
+> **Phase 5 — Consolidation pipeline + snapshots. ✅ BUILT.**
+> Formalized the T2 "sleep cycle" as one entry point, `reflect.py consolidate` (gated by
+> `meta.schema_version=5` so pre-Phase-5 caches rebuild instead of skipping): it runs
+> **abstraction → procedure learning → stale-belief pruning → snapshot/compaction** in order,
+> dry-run by default, `--apply` to write, never blocking an interactive turn. New pieces:
+> (a) **snapshot/compaction** — `cognition.snapshot` records a `snapshot` event (curator-emitted,
+> agent="memory") + a derived-state blob under `runtime/snapshots/` and advances `meta.snapshot_seq`;
+> `cognition._apply_compaction` then marks episodes behind the snapshot that no active thread cites
+> as `nodes.cold` and **drops them from attention seeding** (`_seed`), so the *active* working set
+> stays bounded over unlimited time while the nodes remain in the graph (spreading-reachable, fully
+> replayable) and their meaning persists as concepts/procedures — open loops are never compacted.
+> (b) **Stale-belief pruning** — `reflect.py prune` emits `concept_retired` for concepts whose
+> evidence has all gone cold and which no active thread cites; `_build_concepts` drops them (a later
+> `concept_formed` revives). (c) **Salience recalibration** — derived concept salience is now
+> recency-weighted against its freshest evidence, so cold meaning fades while recurring concepts stay
+> strong (an explicit curator salience still wins). (d) **Entropy caps** — `PRUNE_MAX` plus the
+> existing `ABSTRACT_MAX_NEW`/`PROC_MAX_NEW`. The snapshot blob is a CACHE: a full replay reproduces
+> the graph (incl. the cold set) byte-for-byte; the log stays whole and remains the only truth.
+> Covered by `tests/test_phase5_consolidation.py` (11 tests). *Outcome: unlimited-timescale scaling —
+> the active graph stays small while the log grows.*
 
 > **Phase 6 — Attention dynamics.**
 > Resonance edges, incubation channel, oscillation. *Outcome: associative + anti-fixation cognition.*

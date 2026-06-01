@@ -26,6 +26,8 @@ Subcommands:
     python cognition.py roles                  List multi-agent roles and their focus types
     python cognition.py refresh [--hook]       Stage-4 adaptive refresh: on topic drift,
                                                checkpoint + re-inject fresh workspace
+    python cognition.py snapshot [--apply]     T2 consolidation checkpoint: record a snapshot
+                                               so cold episodes compact (dry-run unless --apply)
 
 Multi-agent (§9): attend/context/subgraph accept --agent <planner|coder|researcher|memory>
 and --threads <t1,t2> to compute a role-biased attention WINDOW over the one shared graph
@@ -54,6 +56,7 @@ EVENTS = RUNTIME / "events.jsonl"
 COG_DB = RUNTIME / "cognition.db"
 THREADS_JSON = RUNTIME / "threads.json"
 WORKING_CONTEXT = RUNTIME / "working_context.md"
+SNAPSHOTS = RUNTIME / "snapshots"          # v4 Phase 5: derived-state snapshot blobs (cache)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -186,7 +189,8 @@ SCHEMA = """
 CREATE TABLE nodes (
     event_id TEXT PRIMARY KEY, seq INTEGER, t TEXT, type TEXT, layer TEXT,
     body TEXT, importance REAL, unresolved INTEGER DEFAULT 0,
-    reinforced INTEGER DEFAULT 0
+    reinforced INTEGER DEFAULT 0,
+    cold INTEGER DEFAULT 0          -- v4 Phase 5: compacted (seq<=snapshot_seq, thread cold)
 );
 CREATE TABLE membership (event_id TEXT, thread_id TEXT);
 CREATE TABLE edges (src TEXT, dst TEXT, kind TEXT, weight REAL);
@@ -232,8 +236,10 @@ CREATE INDEX ix_pev_procedure ON procedure_evidence(procedure_id);
 # never silently satisfies the watermark skip (forces one rebuild). Phase 2 added the
 # concepts/concept_evidence tables and the `concept` edge; Phase 3 added the
 # procedures/procedure_evidence tables and the `procedure` edge; Phase 4 added the
-# `vectors` table (persisted embeddings for hybrid retrieval).
-SCHEMA_VERSION = 4
+# `vectors` table (persisted embeddings for hybrid retrieval); Phase 5 added the
+# `nodes.cold` compaction flag, snapshot bookkeeping (meta.snapshot_seq), concept
+# retirement (`concept_retired`) and recency-recalibrated concept salience.
+SCHEMA_VERSION = 5
 
 
 def _build_watermark(db_path: Path) -> int:
@@ -383,6 +389,9 @@ def build(db_path: Path = COG_DB, force: bool = False) -> dict:
     _build_procedures(conn, events)
     # v4 Phase 4: persist one embedding per node so retrieval is a stored-vector scan.
     _build_vectors(conn)
+    # v4 Phase 5: compact cold episodes behind the latest snapshot (keeps the active
+    # graph small over unlimited time; the log stays whole, meaning persists as concepts).
+    n_cold = _apply_compaction(conn, events)
 
     # watermark: record the event count + schema version this build is a projection of.
     conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('event_count',?)",
@@ -398,6 +407,7 @@ def build(db_path: Path = COG_DB, force: bool = False) -> dict:
         "concepts": conn.execute("SELECT COUNT(*) FROM concepts").fetchone()[0],
         "procedures": conn.execute("SELECT COUNT(*) FROM procedures").fetchone()[0],
         "vectors": conn.execute("SELECT COUNT(*) FROM vectors").fetchone()[0],
+        "cold": n_cold,
         "skipped": False,
     }
     conn.close()
@@ -418,25 +428,46 @@ def _build_concepts(conn, events: list) -> None:
     ALSO materialized as a graph node (type='concept', layer='semantic') wired to its
     evidence by `concept` edges, so spreading activation flows episode<->meaning and the
     concept can seed/surface in working memory. Truth stays in the log; this is a pure
-    projection — absent concept_formed events ⇒ empty semantic memory (current behavior)."""
+    projection — absent concept_formed events ⇒ empty semantic memory (current behavior).
+
+    v4 Phase 5: a `concept_retired` event (curator-emitted) retires a stale concept — it is
+    skipped on materialization (a later `concept_formed` revives it). Derived salience is
+    recency-recalibrated against the freshest evidence, so the meaning of cold episodes
+    fades while recurring concepts stay strong; an explicit event `salience` still wins."""
     acc: dict = {}   # concept_id -> {summary, salience, support, evidence:set, formed_t}
     for e in events:
-        if e.get("type") != "concept_formed":
+        etype = e.get("type")
+        if etype not in ("concept_formed", "concept_retired"):
             continue
         cid = _concept_id_of(e)
         if not cid:
             continue
+        if etype == "concept_retired":
+            if cid in acc:
+                acc[cid]["retired"] = True   # terminal until a later concept_formed revives
+            continue
         ev = _as_list(e.get("evidence"))
         c = acc.setdefault(cid, {"summary": "", "salience": 0.0, "support": 0,
-                                 "evidence": set(), "formed_t": e.get("t")})
+                                 "evidence": set(), "formed_t": e.get("t"), "retired": False})
+        c["retired"] = False                 # (re)forming revives a previously retired concept
         c["summary"] = e.get("summary") or e.get("msg") or c["summary"] or cid
         c["evidence"].update(ev)
         # support: explicit, else cumulative distinct evidence count; reinforces over time.
         c["support"] = int(e.get("support", max(len(c["evidence"]), c["support"] + 1)))
         if e.get("salience") is not None:
             c["salience"] = float(e["salience"])
+    # freshest-evidence timestamp per concept drives salience recalibration (Phase 5).
+    node_t = {r[0]: r[1] for r in conn.execute("SELECT event_id, t FROM nodes")}
     for cid, c in acc.items():
-        sal = c["salience"] or round(min(0.9, 0.4 + 0.1 * c["support"]), 4)
+        if c.get("retired"):
+            continue
+        if c["salience"]:                    # explicit curator salience is authoritative
+            sal = c["salience"]
+        else:
+            ev_ts = [node_t[e] for e in c["evidence"] if node_t.get(e)]
+            rec = _recency(max(ev_ts)) if ev_ts else 1.0
+            base = min(0.9, 0.4 + 0.1 * c["support"])
+            sal = round(base * (0.5 + 0.5 * rec), 4)   # decay cold meaning, floor at half
         conn.execute(
             "INSERT OR REPLACE INTO concepts(concept_id,summary,salience,support,formed_t)"
             " VALUES (?,?,?,?,?)", (cid, c["summary"], sal, c["support"], c["formed_t"]))
@@ -611,6 +642,14 @@ def _seed(conn, query: str, agent: str = "", threads=None) -> dict:
                         "SELECT event_id FROM nodes WHERE body LIKE ?",
                         (f"%{query}%",)):
                     seed[r[0]] = max(seed.get(r[0], 0.0), 0.7)
+    # v4 Phase 5: cold (compacted) episodes are dropped from the seed so the active working
+    # set stays bounded; they remain in the graph and can still be reached via spreading.
+    try:
+        cold = {r[0] for r in conn.execute("SELECT event_id FROM nodes WHERE cold=1")}
+        if cold:
+            seed = {eid: v for eid, v in seed.items() if eid not in cold}
+    except sqlite3.Error:
+        pass  # pre-Phase-5 cache without the cold column; next build() adds it
     return seed
 
 
@@ -821,6 +860,98 @@ def _vector_search(conn, query: str, k: int = VECTOR_TOPK) -> list:
 
     scored.sort(key=lambda x: x[1], reverse=True)
     return [(eid, max(0.0, min(1.0, s))) for eid, s in scored[:k] if s > 0]
+
+
+# ─── consolidation pipeline + snapshots (v4 Phase 5 §9) ──────────────────────
+
+def _snapshot_seq(events: list) -> int:
+    """The event count covered by the latest `snapshot` event (0 if none)."""
+    snap = 0
+    for e in events:
+        if e.get("type") == "snapshot":
+            try:
+                snap = max(snap, int(e.get("snapshot_seq", e.get("seq", 0))))
+            except (TypeError, ValueError):
+                continue
+    return snap
+
+
+def _apply_compaction(conn, events: list) -> int:
+    """Mark episodes COLD when they sit behind the latest snapshot and no longer belong
+    to any active thread (v4 Phase 5). Cold = compacted: excluded from attention SEEDING
+    (`_seed`) so the active working set stays bounded over unlimited time, while the nodes
+    remain in the graph (spreading-reachable, fully replayable) and their meaning persists
+    as concepts/procedures. Open loops (unresolved) are never compacted — finishing wins.
+    Records `meta.snapshot_seq`. No snapshot ⇒ nothing cold ⇒ pre-Phase-5 behavior."""
+    snap = _snapshot_seq(events)
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('snapshot_seq',?)",
+                 (str(snap),))
+    if snap <= 0:
+        return 0
+    active = [r[0] for r in conn.execute(
+        "SELECT thread_id FROM threads WHERE status='active'")]
+    if active:
+        q = ",".join("?" * len(active))
+        conn.execute(
+            "UPDATE nodes SET cold=1 WHERE seq IS NOT NULL AND seq<=? AND unresolved=0 "
+            f"AND event_id NOT IN (SELECT event_id FROM membership "
+            f"WHERE thread_id IN ({q}))", [snap] + active)
+    else:
+        conn.execute("UPDATE nodes SET cold=1 WHERE seq IS NOT NULL AND seq<=? "
+                     "AND unresolved=0", (snap,))
+    return conn.execute("SELECT COUNT(*) FROM nodes WHERE cold=1").fetchone()[0]
+
+
+def snapshot(apply: bool = False) -> dict:
+    """T2 consolidation checkpoint (v4 Phase 5 §9): record a snapshot of derived state at
+    the current event count, and (with apply) emit a `snapshot` event + a snapshot blob so
+    later builds compact cold episodes behind it.
+
+    The blob under runtime/snapshots/ is a CACHE — a full replay still reproduces the graph
+    byte-for-byte; the `snapshot` event and `meta.snapshot_seq` are the bookkeeping that
+    keeps the ACTIVE graph small. Curator-owned (agent='memory'); append-only, so it never
+    edits truth. Dry-run by default."""
+    build()  # ensure the graph reflects the current log before snapshotting
+    events = read_events()
+    seq = len(events)
+    conn = sqlite3.connect(COG_DB)
+    conn.row_factory = sqlite3.Row
+    counts = {
+        "nodes": conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0],
+        "edges": conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
+        "threads": conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0],
+    }
+    blob = {
+        "snapshot_seq": seq,
+        "generated": now_iso(),
+        "schema_version": SCHEMA_VERSION,
+        "counts": counts,
+        "concepts": [dict(r) for r in conn.execute(
+            "SELECT concept_id,summary,salience,support FROM concepts ORDER BY concept_id")],
+        "procedures": [dict(r) for r in conn.execute(
+            "SELECT procedure_id,label,trigger,outcome_score FROM procedures "
+            "ORDER BY procedure_id")],
+        "threads": [dict(r) for r in conn.execute(
+            "SELECT thread_id,title,status,n_events FROM threads ORDER BY thread_id")],
+    }
+    conn.close()
+
+    written = None
+    if apply:
+        SNAPSHOTS.mkdir(parents=True, exist_ok=True)
+        path = SNAPSHOTS / f"snap_{seq}.json"
+        path.write_text(json.dumps(blob, indent=2, ensure_ascii=False), encoding="utf-8")
+        written = str(path.relative_to(ROOT))
+        try:
+            import runtime
+            runtime.append("snapshot", agent="memory", snapshot_seq=seq,
+                           nodes=counts["nodes"], concepts=len(blob["concepts"]),
+                           procedures=len(blob["procedures"]))
+        except Exception:
+            pass
+        build()  # rebuild so cold compaction applies behind the just-recorded snapshot
+    return {"snapshot_seq": seq, "counts": counts, "concepts": len(blob["concepts"]),
+            "procedures": len(blob["procedures"]), "written": written, "applied": apply}
 
 
 def attend(query: str = "", persist: bool = True, agent: str = "", threads=None) -> dict:
@@ -1245,9 +1376,21 @@ def main(argv):
         s = build(force="--force" in rest)
         verb = "up-to-date (skipped rebuild)" if s.get("skipped") else "built"
         vecs = f", {s['vectors']} vectors" if "vectors" in s else ""
+        cold = f", {s['cold']} cold" if s.get("cold") else ""
         print(f"Graph {verb} from {s['events']} events: {s['nodes']} nodes, "
-              f"{s['threads']} threads, {s['edges']} edges{vecs} -> "
+              f"{s['threads']} threads, {s['edges']} edges{vecs}{cold} -> "
               f"{COG_DB.relative_to(ROOT)}")
+        return 0
+
+    if cmd == "snapshot":
+        s = snapshot(apply="--apply" in rest)
+        if s["applied"]:
+            print(f"Snapshot taken at seq {s['snapshot_seq']}: {s['concepts']} concepts, "
+                  f"{s['procedures']} procedures retained -> {s['written']}")
+        else:
+            print(f"  dry-run: snapshot would cover {s['snapshot_seq']} events "
+                  f"({s['counts']['nodes']} nodes, {s['concepts']} concepts, "
+                  f"{s['procedures']} procedures). Re-run with --apply to record it.")
         return 0
 
     def _opt(r, name):
