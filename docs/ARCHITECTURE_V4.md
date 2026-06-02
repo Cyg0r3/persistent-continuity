@@ -640,7 +640,7 @@ Memory retrieval recalls *what happened*. Pattern-aware cognition recognizes *wh
 again*. Patterns become **first-class memory objects** — a fourth `mem_class` ('pattern') alongside
 episodic/semantic/procedural — derived from the projected graph, never hand-authored.
 
-**What is mined** (a T2 offline pass, `patterns.py mine`, dry-run by default, `--apply` to emit):
+**What is mined** (a T2 offline pass, `reflect.py mine`, dry-run by default, `--apply` to emit):
 - **recurring reasoning structures** — repeated subgraph motifs in the causal DAG (same shape of
   decision→action→outcome chain across threads).
 - **repeated failure modes** — causal chains that recurrently terminate in `assumption_invalidated`,
