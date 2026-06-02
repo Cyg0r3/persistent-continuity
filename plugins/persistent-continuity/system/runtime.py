@@ -34,6 +34,8 @@ from _paths import data_root
 ROOT = data_root()
 RUNTIME = ROOT / "runtime"
 EVENTS = RUNTIME / "events.jsonl"
+SEQ_FILE = RUNTIME / "seq"          # persisted event counter (v4 Phase 0): kills the
+                                    # O(N)-per-append log scan that made id assignment O(N²)
 WORKING_CONTEXT = RUNTIME / "working_context.md"
 ACTIVE_CONTEXT = RUNTIME / "active_context.json"
 SESSION_STATE = RUNTIME / "session_state.json"
@@ -57,13 +59,58 @@ KNOWN_TYPES = {
     # v3 cognition-native additions (ARCHITECTURE_V3.md)
     "observation", "hypothesis", "contradiction", "output", "api_call",
     "command", "thread_open", "thread_merge", "thread_split", "attended",
+    # v4 Phase 2 semantic memory: the memory curator consolidates episodes into concepts
+    "concept_formed",
+    # v4 Phase 3 procedural memory: the curator distills successful workflows into procedures
+    "procedure_learned",
+    # v4 Phase 5 consolidation: snapshot checkpoint + stale-concept retirement (curator-owned)
+    "snapshot", "concept_retired",
+    # v4 Phase 7 branching/versioning: label a hypothetical line of cognition + fold it back
+    "branch_open", "branch_merge",
+    # v4.1 Phase 8 pattern recognition: the curator records a recurring pattern it mined
+    "pattern_detected",
+    # v4.1 Phase 9 adaptive procedural learning: episodic execution outcome (anyone may emit);
+    # the curator retires a chronically-failing procedure
+    "proc_executed", "procedure_retired",
+    # v4.1 Phase 10 meta-cognition: the curator's bounded self-evaluation of reasoning quality
+    "meta_assessment",
+    # v4.1 Phase 11 pattern-to-procedure pipeline: the curator promotes a recurring success
+    # pattern into a procedural heuristic, linking pattern_id -> procedure_id (§16)
+    "pattern_promoted",
 }
+
+# v4 Phase 7 multi-agent arbitration (§10): the memory curator owns consolidation. These
+# event types are CONCLUSIONS the curator emits after arbitrating proposals; other agents
+# *propose* (hypothesis/contradiction/...) but do not consolidate. Emitting one under a
+# non-curator agent is flagged (append-only ⇒ never rejected, only made auditable).
+CURATOR_AGENT = "memory"
+CURATOR_TYPES = {
+    "concept_formed", "procedure_learned", "concept_retired",
+    "assumption_invalidated", "loop_closed", "snapshot",
+    "pattern_detected",
+    # v4.1 Phase 9: retiring a procedure is a curator conclusion (proc_executed is NOT — anyone executes)
+    "procedure_retired",
+    # v4.1 Phase 10: the meta-cognitive self-assessment is a curator conclusion (a projection of
+    # already-derived signals; emitting one under a named non-curator agent is auditable)
+    "meta_assessment",
+    # v4.1 Phase 11: promoting a mined pattern into a procedure is a consolidation conclusion the
+    # curator owns (proc_executed reinforcement that follows is NOT — anyone executes the workflow)
+    "pattern_promoted",
+}
+
+
+def is_arbitration_violation(event_type: str, agent) -> bool:
+    """True iff a curator-owned consolidation type is being emitted by a *named*
+    non-curator agent (un-agented system/CLI writes are the curator path, so allowed)."""
+    return (event_type in CURATOR_TYPES
+            and bool(agent) and agent != CURATOR_AGENT)
 
 # v3: cognitive vs execution vs meta layer, inferred from type when not given (§4).
 COGNITIVE_TYPES = {
     "objective", "decision", "observation", "reflection", "hypothesis",
     "contradiction", "assumption", "assumption_invalidated", "open_loop",
-    "loop_closed", "topic_shift",
+    "loop_closed", "topic_shift", "concept_formed", "procedure_learned",
+    "concept_retired",
 }
 EXECUTION_TYPES = {"artifact", "output", "api_call", "error", "command"}
 
@@ -96,19 +143,58 @@ def parse_iso(s: str) -> datetime:
 
 # ─── L1: event log (truth) ───────────────────────────────────────────────────
 
+def _count_events() -> int:
+    """Count events by streaming the log (no full parse). Used only to (re)seed the
+    persisted counter — the slow path we are replacing for steady-state appends."""
+    if not EVENTS.exists():
+        return 0
+    n = 0
+    with EVENTS.open("r", encoding="utf-8") as fh:
+        for raw in fh:
+            if raw.strip():
+                n += 1
+    return n
+
+
+def _read_seq() -> int:
+    """Current persisted event count, or None if absent/unreadable (caller reseeds)."""
+    try:
+        return int(SEQ_FILE.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def next_seq() -> int:
+    """Allocate the next 1-based event sequence number in O(1) (v4 Phase 0).
+
+    Truth is still the log; `seq` is a rebuildable cache. If it is missing or has
+    drifted below the actual line count (e.g. the log was edited out-of-band), it
+    self-heals by re-counting — so correctness never depends on the cache being right,
+    only its speed does."""
+    cur = _read_seq()
+    if cur is None or cur < _count_events():
+        cur = _count_events()
+    nxt = cur + 1
+    SEQ_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SEQ_FILE.write_text(str(nxt), encoding="utf-8")
+    return nxt
+
+
 def append(event_type: str, **fields) -> dict:
     """Validate and append one event as a JSON line. Never edits existing lines.
 
     v3: assigns a stable `event_id` (evt_<seq>) and infers `layer` from type when
     not supplied; `thread_ids`/`causes` accept a list or comma-string. All v3 fields
-    are optional — omitting them yields exactly a v2 event (backward compatible)."""
+    are optional — omitting them yields exactly a v2 event (backward compatible).
+    v4 Phase 0: the `event_id` sequence comes from a persisted O(1) counter
+    (`runtime/seq`) instead of re-reading the whole log on every append."""
     if not event_type or not isinstance(event_type, str):
         raise ValueError("event requires a non-empty string 'type'")
     event = {"t": fields.pop("t", now_iso()), "type": event_type}
 
     # v3 graph fields (kept out of the dict when empty to stay v2-clean).
     if "event_id" not in fields:
-        fields["event_id"] = f"evt_{len(read_events()) + 1}"
+        fields["event_id"] = f"evt_{next_seq()}"
     if "layer" not in fields:
         fields["layer"] = infer_layer(event_type)
     for k in ("thread_ids", "causes"):
@@ -117,6 +203,10 @@ def append(event_type: str, **fields) -> dict:
             fields[k] = [s.strip() for s in v.split(",") if s.strip()]
         elif v in (None, ""):
             fields.pop(k, None)
+    # v4 Phase 7: `branch` is optional; the default branch is "main", so an absent or
+    # "main" value is dropped to keep events v2-clean (absent ⇒ main, back-compatible).
+    if fields.get("branch") in (None, "", "main"):
+        fields.pop("branch", None)
 
     event.update(fields)
     # validate it round-trips as a single JSON line before committing
@@ -127,6 +217,10 @@ def append(event_type: str, **fields) -> dict:
         fh.write(line + "\n")
     if event_type not in KNOWN_TYPES:
         print(f"  (note: '{event_type}' is an unknown type — stored, not modeled)")
+    if is_arbitration_violation(event_type, event.get("agent")):
+        print(f"  (note: '{event_type}' is curator-owned (agent='{CURATOR_AGENT}'); "
+              f"agent='{event.get('agent')}' should PROPOSE, not consolidate — stored, "
+              f"flagged for arbitration audit)", file=sys.stderr)
     return event
 
 
@@ -332,6 +426,13 @@ def checkpoint(reason: str = "manual", end_status: str = "paused",
 
     keep_open=True records the checkpoint marker WITHOUT ending the session —
     used by the PreCompact hook (context-pressure checkpoint mid-session)."""
+    # Uninitialized project (plugin enabled but /continuity-init not run): stay
+    # silent and DO NOT create .continuity/. The SessionEnd/PreCompact hooks call
+    # this on every project; without this guard append() would mkdir + seed a
+    # stray events.jsonl, littering projects that never opted in (mirrors restore()).
+    if not EVENTS.exists():
+        return {"event_count": 0, "status": "uninitialized", "project": None,
+                "open_loops": {}, "checkpoints": 0, "session": None}
     state = derive_state()
     append("checkpoint", reason=reason, session=state["session"])
     if state["session"] and not keep_open:

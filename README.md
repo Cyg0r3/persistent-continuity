@@ -142,5 +142,19 @@ python system/cognition.py context "query"           # synthesize the working le
 python system/cognition.py threads                   # list threads (active/dormant/merged)
 ```
 
+### Multi-agent attention (optional)
+
+Several agents can share one graph, each viewing it through a **role-biased attention
+window** (constrained seed, full-graph spread — soft bias, not silos). The single-agent
+flow above is unchanged when you don't pass `--agent`.
+
+```bash
+python system/cognition.py roles                            # planner|coder|researcher|memory
+python system/cognition.py context "query" --agent coder    # a coder's window over the shared graph
+python system/cognition.py attend --agent planner --threads infra,api   # scope to assigned threads
+python system/reflect.py resolve                            # memory agent: resolve decided tensions (dry-run)
+python system/reflect.py resolve --apply                    # ...and write the verdicts (assumption_invalidated / loop_closed)
+```
+
 Data root resolves the same way for the CLI as for the hooks (`CONTINUITY_HOME` or
 `<cwd>/.continuity`), so run them from your project directory.
